@@ -657,9 +657,11 @@ graph_tests = [
     Test("writeDistRandom", writeDist),
     Test("writeDistWorkload", workloadDist),
     Test("writeThroughput", readThroughput),
+    Test("writeThroughputMMC", readThroughput),
     Test("workloadThroughput", readThroughput),
     Test("linearizableWriteDistRandom", writeDist),
     Test("linearizableWriteThroughput", readThroughput),
+    Test("linearizableWriteThroughputMMC", readThroughput),
 ]
 
 if __name__ == '__main__':

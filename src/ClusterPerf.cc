@@ -47,6 +47,7 @@ namespace po = boost::program_options;
 
 #include "assert.h"
 #include "btreeRamCloud/Btree.h"
+#include "ClientLease.h"
 #include "CycleCounter.h"
 #include "Cycles.h"
 #include "PerfStats.h"
@@ -607,6 +608,106 @@ printPercent(const char* name, double value, const char* description)
 {
     printf("%-20s    %.1f %%      %s\n", name, value, description);
 }
+
+class MultiClientMasterSlave {
+  public:
+    MultiClientMasterSlave()
+    {}
+    virtual ~MultiClientMasterSlave()
+    {}
+
+    void run()
+    {
+        if (clientIndex == 0) {
+            runMaster();
+        } else {
+            runSlave();
+        }
+    }
+
+    virtual void runMaster() = 0;
+    virtual void runSlave() = 0;
+};
+
+class WriteThroughputMasterSlave : public MultiClientMasterSlave {
+  public:
+    WriteThroughputMasterSlave()
+        : MultiClientMasterSlave()
+    {}
+    virtual ~WriteThroughputMasterSlave()
+    {}
+
+    void printDataHeader() {
+        printf("#\n");
+        printf("# clients   throughput   worker   cleaner  compactor  "
+                "cleaner  dispatch  netOut    netIn\n");
+        printf("#           (kops/sec)   cores     cores    free %%    "
+                "free %%   utiliz.   (MB/s)    (MB/s)\n");
+        printf("#------------------------------------------------------"
+                "--------------------------------------------\n");
+    }
+
+    void collectAndPrintData(int numClients) {
+        Buffer statsBuffer;
+        cluster->objectServerControl(dataTable, "abc", 3,
+                WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                &statsBuffer);
+        PerfStats startStats = *statsBuffer.getStart<PerfStats>();
+        Cycles::sleep(1000000);
+        cluster->objectServerControl(dataTable, "abc", 3,
+                WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                &statsBuffer);
+        PerfStats finishStats = *statsBuffer.getStart<PerfStats>();
+        double elapsedCycles = static_cast<double>(
+                finishStats.collectionTime - startStats.collectionTime);
+        double elapsedTime = elapsedCycles/ finishStats.cyclesPerSecond;
+        double rate = static_cast<double>(finishStats.writeCount -
+                startStats.writeCount) / elapsedTime;
+        double utilization = static_cast<double>(
+                finishStats.workerActiveCycles -
+                startStats.workerActiveCycles) / elapsedCycles;
+        double cleanerUtilization = static_cast<double>(
+                (finishStats.compactorActiveCycles +
+                finishStats.cleanerActiveCycles) -
+                (startStats.compactorActiveCycles +
+                startStats.cleanerActiveCycles)) / elapsedCycles;
+        double compactorFreePct =
+                static_cast<double>(finishStats.compactorInputBytes -
+                startStats.compactorInputBytes) -
+                static_cast<double>(finishStats.compactorSurvivorBytes -
+                startStats.compactorSurvivorBytes);
+        if (compactorFreePct != 0) {
+            compactorFreePct = 100.0 * compactorFreePct /
+                    static_cast<double>(finishStats.compactorInputBytes -
+                    startStats.compactorInputBytes);
+        }
+        double cleanerFreePct =
+                static_cast<double>(finishStats.cleanerInputDiskBytes -
+                startStats.cleanerInputDiskBytes) -
+                static_cast<double>(finishStats.cleanerSurvivorBytes -
+                startStats.cleanerSurvivorBytes);
+        if (cleanerFreePct != 0) {
+            cleanerFreePct = 100.0 * cleanerFreePct /
+                    static_cast<double>(finishStats.cleanerInputDiskBytes -
+                    startStats.cleanerInputDiskBytes);
+        }
+        double dispatchUtilization = static_cast<double>(
+                finishStats.dispatchActiveCycles -
+                startStats.dispatchActiveCycles) / elapsedCycles;
+        double netOutRate = static_cast<double>(
+                finishStats.networkOutputBytes -
+                startStats.networkOutputBytes) / elapsedTime;
+        double netInRate = static_cast<double>(
+                finishStats.networkInputBytes -
+                startStats.networkInputBytes) / elapsedTime;
+        printf("%7d     %8.2f   %8.3f %8.3f %8.1f  %8.1f  %8.3f "
+                "%8.2f  %8.2f\n",
+                numClients, rate/1e03, utilization, cleanerUtilization,
+                compactorFreePct, cleanerFreePct, dispatchUtilization,
+                netOutRate/1e06, netInRate/1e06);
+    }
+};
+
 
 /**
  * Time how long it takes to do an indexed write/overwrite.
@@ -6063,6 +6164,368 @@ linearizableRpc()
     }
 }
 
+class MassivelyMultiClientWriteThroughput : public WriteThroughputMasterSlave {
+  public:
+    explicit MassivelyMultiClientWriteThroughput(bool linearizable)
+        : WriteThroughputMasterSlave()
+        , linearizable(linearizable)
+        , clientCount(0)
+        , clientCountMagnitude(1)
+        , size(objectSize)
+        , keySize(30)
+        , numObjects(400000000/size)
+        , nextSample(0)
+        , timeSample()
+        , clientList()
+        , nextClient(clientList.begin())
+        , clientListEmpty(true)
+    {
+        for (int i = 0; i < sampleCount; ++i) {
+            timeSample[i] = 0;
+        }
+    }
+
+    ~MassivelyMultiClientWriteThroughput()
+    {
+
+        for (auto it = clientList.begin(); it != clientList.end(); ++it) {
+            delete *it;
+        }
+    }
+
+    virtual void runMaster() {
+        printf("# RAMCloud write throughput of a single server with a varying\n"
+               "# number of clients issuing individual write on randomly\n"
+               "# chosen %d-byte objects with %d-byte keys\n",
+               size, keySize);
+        if (linearizable) {
+            printf("# Writes are linearizable.\n");
+        } else {
+            printf("# Writes are NON-linearizable.\n");
+        }
+        printf("# Generated by 'clusterperf.py writeThroughputMMC'\n");
+        printDataHeader();
+        for (int i = 1; i < numTables; ++i) {
+            char tableName[20];
+            snprintf(tableName, sizeof(tableName), "table%d", i);
+            cluster->createTable(tableName);
+        }
+
+        fillTable(dataTable, numObjects, keySize, size);
+        for (int i = 1; i < numTables; ++i) {
+            if (i % numClients == clientIndex) {
+                char tableName[20];
+                snprintf(tableName, sizeof(tableName), "table%d", i);
+                uint64_t tableId = cluster->getTableId(tableName);
+                fillTable(tableId, numObjects, keySize, size);
+            }
+        }
+
+        sendCommand("prepare", NULL, 1, numClients-1);
+        for (int i = 0; i < numClients-1; i++) {
+            waitSlave(1+i, "ready", 60.0);
+        }
+        while (clientCount < 1000000) {
+            incrementClientCount();
+            sendCommand("start-next", "running", 1, numClients-1);
+            collectAndPrintData(clientCount);
+            sendCommand("prepare", NULL, 1, numClients-1);
+            for (int i = 0; i < numClients-1; i++) {
+                waitSlave(1+i, "ready", 60.0);
+            }
+        }
+        sendCommand("done", "done", 1, numClients-1);
+    }
+
+    virtual void runSlave() {
+        bool running = false;
+        bool ready  = false;
+
+        uint64_t startTime = Cycles::rdtsc();
+        int objectsWritten = 0;
+        uint64_t tableIds[numTables];
+
+        tableIds[0] = dataTable;
+        for (int i = 1; i < numTables; ++i) {
+            char tableName[20];
+            snprintf(tableName, sizeof(tableName), "table%d", i);
+            cluster->createTable(tableName);
+            tableIds[i] = cluster->getTableId(tableName);
+            if (i % numClients == clientIndex) {
+                fillTable(tableIds[i], numObjects, keySize, size);
+            }
+        }
+
+        while (true) {
+            char command[20];
+            if (running) {
+                // Write out some statistics for debugging.
+                double totalTime = Cycles::toSeconds(Cycles::rdtsc()
+                        - startTime);
+                double rate = objectsWritten/totalTime;
+                RAMCLOUD_LOG(NOTICE, "Write rate: %.1f kobjects/sec",
+                        rate/1e03);
+            }
+            getCommand(command, sizeof(command), false);
+            if (strcmp(command, "prepare") == 0) {
+                if (!ready) {
+                    running = false;
+                    ready = true;
+                    init(tableIds);
+                    setSlaveState("ready");
+                }
+                doWorkload(tableIds);
+            } else if (strcmp(command, "start-next") == 0) {
+                if (!running) {
+                    running = true;
+                    ready = false;
+                    RAMCLOUD_LOG(NOTICE,
+                            "Starting writeThroughputMMC benchmark: "
+                            "ClientCount = %d", clientCount);
+                    setSlaveState("running");
+                    startTime = Cycles::rdtsc();
+                    objectsWritten = 0;
+                }
+
+                // Perform workload for a second (then check to see
+                // if the experiment is over).
+                startTime = Cycles::rdtsc();
+                objectsWritten = 0;
+                uint64_t checkTime = startTime + Cycles::fromSeconds(1.0);
+                do {
+                    // Do workload.
+                    if (doWorkload(tableIds)) {
+                        ++objectsWritten;
+                    }
+                } while (Cycles::rdtsc() < checkTime);
+            } else if (strcmp(command, "done") == 0) {
+                setSlaveState("done");
+                RAMCLOUD_LOG(NOTICE,
+                             "Ending writeThroughputMMC benchmark");
+                return;
+            } else {
+                RAMCLOUD_LOG(ERROR, "unknown command %s", command);
+                return;
+            }
+        }
+    }
+
+    void resetVirtualClients() {
+        for (auto it = clientList.begin(); it != clientList.end(); ++it) {
+            VirtualClient* vc = *it;
+            VirtualClient::Context _(vc);
+
+            vc->lease.getLease();
+            vc->rpc.destroy();
+            vc->cycleTime = 0;
+        }
+    }
+
+    void init(const uint64_t tableIds[]) {
+        incrementClientCount();
+        uint32_t expectedClientListSize = (clientCount/(numClients-1)) +
+                (clientIndex <= clientCount % (numClients-1));
+        while (clientList.size() < expectedClientListSize) {
+            clientList.push_back(new VirtualClient(cluster));
+            cluster->poll();
+        }
+
+        if (clientList.size() > 0) {
+            clientListEmpty = false;
+        }
+
+        resetVirtualClients();
+
+        nextClient = clientList.begin();
+
+        if (!clientListEmpty) {
+            // warmup
+            int startSample = nextSample;
+            do {
+                doWorkload(tableIds);
+            } while (startSample != nextSample);
+        }
+
+        resetVirtualClients();
+    }
+
+    bool doWorkload(const uint64_t tableIds[]) {
+        cluster->poll();
+
+        if (clientListEmpty) {
+            return false;
+        }
+
+        VirtualClient* vc = *nextClient++;
+        if (nextClient == clientList.end()) {
+            nextClient = clientList.begin();
+        }
+
+        // Set the context
+        VirtualClient::Context _(vc);
+
+        if (vc->rpc) {
+            // See if real rpc is done.
+            if (vc->rpc->isReady()) {
+                vc->rpc->wait();
+                vc->rpc.destroy();
+                vc->writeData.destroy();
+                timeSample[nextSample++] = Cycles::rdtsc() - vc->cycleTime;
+
+                // Reset nextSample
+                if (nextSample >= sampleCount) {
+                    nextSample = 0;
+                }
+            } else {
+                return false;
+            }
+        } else {
+            // see if fake RPC is done.
+            if (vc->cycleTime < Cycles::rdtsc()) {
+                // fake processing complete
+            } else {
+                return false;
+            }
+        }
+
+        int virtualServerIndex = downCast<int>(
+                generateRandom() % virtualServerCount);
+
+        if (virtualServerIndex < numTables) {
+            // Issue a real RPC if the target server is randomly selected.
+            vc->cycleTime = Cycles::rdtsc();
+            uint64_t tableId = tableIds[virtualServerIndex];
+
+            char* key = new char[keySize];
+            char* object = new char[size];
+            makeKey(downCast<int>(generateRandom() % numObjects),
+                    keySize, key);
+            Util::genRandomString(object, size);
+
+            vc->writeData.construct(tableId, key, keySize, object, size);
+            vc->rpc.construct(cluster,
+                              vc->writeData->tableId,
+                              vc->writeData->key,
+                              vc->writeData->keyLength,
+                              vc->writeData->object,
+                              vc->writeData->objectLength,
+                              (const RejectRules*)NULL,
+                              false,
+                              linearizable);
+            return true;
+        } else {
+            // Select a random time from our sampled completion times as a
+            // virtual completion time.
+            vc->cycleTime = Cycles::rdtsc() +
+                            timeSample[generateRandom() % sampleCount];
+            return false;
+        }
+    }
+
+    void incrementClientCount() {
+        clientCount += clientCountMagnitude;
+        if (clientCount == 10 * clientCountMagnitude) {
+            clientCountMagnitude = 10 * clientCountMagnitude;
+        }
+    }
+
+    struct WriteData {
+        WriteData(uint64_t tableId,
+                  const char* key,
+                  uint16_t keyLength,
+                  const char* object,
+                  uint32_t objectLength)
+            : tableId(tableId)
+            , key(key)
+            , keyLength(keyLength)
+            , object(object)
+            , objectLength(objectLength)
+        {
+        }
+
+        ~WriteData() {
+            delete[] key;
+            delete[] object;
+        }
+
+        uint64_t tableId;
+        const char* key;
+        uint16_t keyLength;
+        const char* object;
+        uint32_t objectLength;
+        DISALLOW_COPY_AND_ASSIGN(WriteData);
+    };
+
+    struct VirtualClient {
+        explicit VirtualClient(RamCloud* ramcloud)
+            : lease(ramcloud)
+            , rpcTracker()
+            , rpc()
+            , writeData()
+            , cycleTime(0)
+        {}
+
+        struct Context {
+            explicit Context(VirtualClient* virtualClient)
+                : virtualClient(virtualClient)
+                , originalLease(cluster->clientLease)
+                , originalTracker(cluster->rpcTracker)
+            {
+                // Set context variables.
+                cluster->clientLease = &virtualClient->lease;
+                cluster->rpcTracker = &virtualClient->rpcTracker;
+            }
+
+            ~Context() {
+                cluster->clientLease = originalLease;
+                cluster->rpcTracker = originalTracker;
+            }
+
+            VirtualClient* virtualClient;
+            ClientLease* originalLease;
+            RpcTracker* originalTracker;
+
+            DISALLOW_COPY_AND_ASSIGN(Context);
+        };
+
+        ClientLease lease;
+        RpcTracker rpcTracker;
+        Tub<WriteRpc> rpc;
+        Tub<WriteData> writeData;
+        uint64_t cycleTime;     // Used as the start time if an rpc is issued
+                                // or the mock rpc delay if not.
+        DISALLOW_COPY_AND_ASSIGN(VirtualClient);
+    };
+
+    static const int virtualServerCount = 10000;
+    static const int sampleCount = 10000;
+
+    bool linearizable;
+    int clientCount;
+    int clientCountMagnitude;
+    int size;
+    const uint16_t keySize;
+    const int numObjects;
+    int nextSample;
+    uint64_t timeSample[sampleCount];
+    typedef std::vector<VirtualClient*> ClientList;
+    ClientList clientList;
+    ClientList::iterator nextClient;
+    bool clientListEmpty;
+};
+
+void
+writeThroughputMMC() {
+    MassivelyMultiClientWriteThroughput mmc(false);
+    mmc.run();
+}
+
+void
+linearizableWriteThroughputMMC() {
+    MassivelyMultiClientWriteThroughput mmc(true);
+    mmc.run();
+}
+
 // The following struct and table define each performance test in terms of
 // a string name and a function that implements the test.
 struct TestInfo {
@@ -6107,9 +6570,11 @@ TestInfo tests[] = {
     {"writeDistRandom", writeDistRandom},
     {"writeDistWorkload", writeDistWorkload},
     {"writeThroughput", writeThroughput},
+    {"writeThroughputMMC", writeThroughputMMC},
     {"workloadThroughput", workloadThroughput},
     {"linearizableWriteDistRandom", linearizableWriteDistRandom},
     {"linearizableWriteThroughput", linearizableWriteThroughput},
+    {"linearizableWriteThroughputMMC", linearizableWriteThroughputMMC},
     {"linearizableRpc", linearizableRpc},
 };
 
