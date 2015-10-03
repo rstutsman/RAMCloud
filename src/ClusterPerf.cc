@@ -2084,6 +2084,298 @@ doMultiRead(int dataLength, uint16_t keyLength,
     return latency;
 }
 
+void
+doMultiReadNoColocation(int dataLength, uint16_t keyLength,
+            int numMasters, int objsPerMaster,
+            bool randomize = false)
+{
+    std::vector<uint64_t> tableIds(numMasters);
+    const uint16_t keyLen = 30;
+    char key[keyLen];
+    uint32_t id;
+
+    if (clientIndex == 0) {
+
+        createTables(tableIds, dataLength, "0", 1);
+
+        memset(key, 0, keyLen);
+
+        for (id = 3; id <= tableIds.size() + 2; id++)
+            cluster->objectServerControl(3, key, keyLen,
+                                    WireFormat::START_PERF_COUNTERS);
+
+        sendCommand("run", "running", 1, numClients-1);
+
+        Buffer statsBuffer;
+        PerfStats startStats[tableIds.size()];
+        PerfStats finishStats[tableIds.size()];
+
+        for (id = 3; id <= tableIds.size() + 2; id++) {
+            cluster->objectServerControl(id, key, keyLen,
+                    WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                    &statsBuffer);
+
+            startStats[id - 3] = *statsBuffer.getStart<PerfStats>();
+        }
+
+        Cycles::sleep(1000000);
+
+        for (id = 3; id <= tableIds.size() + 2; id++) {
+            cluster->objectServerControl(id, key, keyLen,
+                    WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                    &statsBuffer);
+            finishStats[id - 3] = *statsBuffer.getStart<PerfStats>();
+
+            double elapsedTime = static_cast<double>(finishStats[id -3].collectionTime -
+                    startStats[id - 3].collectionTime)/ finishStats[id - 3].cyclesPerSecond;
+            double rate = static_cast<double>(finishStats[id -3].readCount -
+                    startStats[id -3].readCount) / elapsedTime;
+            double utilization = static_cast<double>(
+                    finishStats[id -3].workerActiveCycles -
+                    startStats[id -3].workerActiveCycles) / static_cast<double>(
+                    finishStats[id -3].collectionTime - startStats[id -3].collectionTime);
+            double dispatchUtilization = static_cast<double>(
+                    finishStats[id -3].dispatchActiveCycles -
+                    startStats[id -3].dispatchActiveCycles) / static_cast<double>(
+                    finishStats[id -3].collectionTime - startStats[id -3].collectionTime);
+            printf("server %d %.0f %8.3f %8.3f\n",
+                    id -2, rate/1e03, utilization, dispatchUtilization);
+        }
+
+        sendCommand("done", "done", 1, numClients-1);
+
+    } else {
+
+        bool running = false;
+
+        uint64_t startTime;
+        bool firstRead = true;
+
+        Buffer input;
+
+        MultiReadObject requestObjects[objsPerMaster];
+        MultiReadObject* requests[objsPerMaster];
+        Tub<ObjectBuffer> values[objsPerMaster];
+        char keys[objsPerMaster][keyLength];
+
+
+        while (true) {
+            char command[20];
+
+            getCommand(command, sizeof(command), false);
+            if (strcmp(command, "run") == 0) {
+                if (!running) {
+                    setSlaveState("running");
+                    running = true;
+                    RAMCLOUD_LOG(NOTICE,
+                            "Starting multiReadThroughput benchmark");
+                }
+
+                startTime = Cycles::rdtsc();
+                uint64_t checkTime = startTime + Cycles::fromSeconds(1.0);
+                do {
+                    if (firstRead) {
+                        getTableIds(tableIds);
+                        for (int tableNum = 0; tableNum < objsPerMaster; tableNum++) {
+                            for (int i = 0; i < 1; i++) {
+                                Util::genRandomString(keys[tableNum], keyLength);
+                                fillBuffer(input, dataLength, tableIds.at((tableNum + clientIndex - 1)%numTables),
+                                        keys[tableNum], keyLength);
+
+                                // Write each object to the cluster
+                                cluster->write(tableIds.at((tableNum + clientIndex - 1)%numTables), keys[tableNum], keyLength,
+                                        input.getRange(0, dataLength), dataLength);
+
+                                // Create read object corresponding to each object to be
+                                // used in the multiread request later.
+                                requestObjects[tableNum] =
+                                        MultiReadObject(tableIds.at((tableNum + clientIndex - 1)%numTables),
+                                        keys[tableNum], keyLength, &values[tableNum]);
+                                requests[tableNum] = &requestObjects[tableNum];
+                            }
+                        }
+                        // Scramble the requests. Checking code below it stays valid
+                        // since the value buffer is a pointer to a Buffer in the request.
+                        if (randomize) {
+                           // Candy: don't need randomize now
+                           // uint64_t numRequests = numMasters*objsPerMaster;
+                           // MultiReadObject** reqs = *requests;
+
+                           // for (uint64_t i = 0; i < numRequests; i++) {
+                           //     uint64_t rand = generateRandom() % numRequests;
+
+                           //     MultiReadObject* tmp = reqs[i];
+                           //     reqs[i] = reqs[rand];
+                           //     reqs[rand] = tmp;
+                           // }
+                        }
+
+                        cluster->multiRead(requests, objsPerMaster);
+                        firstRead = false;
+                    }
+
+                    cluster->multiRead(requests, objsPerMaster);
+
+                } while (Cycles::rdtsc() < checkTime);
+            } else if (strcmp(command, "done") == 0) {
+                setSlaveState("done");
+                RAMCLOUD_LOG(NOTICE, "Ending multiReadThroughput benchmark");
+                return;
+            } else {
+                RAMCLOUD_LOG(ERROR, "unknown command %s", command);
+                return;
+            }
+
+        }
+    }
+}
+
+void
+doMultiReadColocation(int dataLength, uint16_t keyLength,
+            int numMasters, int objsPerMaster,
+            bool randomize = false)
+{
+    std::vector<uint64_t> tableIds(numMasters);
+    const uint16_t keyLen = 30;
+    char key[keyLen];
+    uint32_t id;
+
+    if (clientIndex == 0) {
+
+        createTables(tableIds, dataLength, "0", 1);
+
+        memset(key, 0, keyLen);
+
+        for (id = 3; id <= tableIds.size() + 2; id++)
+            cluster->objectServerControl(3, key, keyLen,
+                                    WireFormat::START_PERF_COUNTERS);
+
+        sendCommand("run", "running", 1, numClients-1);
+
+        Buffer statsBuffer;
+        PerfStats startStats[tableIds.size()];
+        PerfStats finishStats[tableIds.size()];
+
+        for (id = 3; id <= tableIds.size() + 2; id++) {
+            cluster->objectServerControl(id, key, keyLen,
+                    WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                    &statsBuffer);
+
+            startStats[id - 3] = *statsBuffer.getStart<PerfStats>();
+        }
+
+        Cycles::sleep(1000000);
+
+        for (id = 3; id <= tableIds.size() + 2; id++) {
+            cluster->objectServerControl(id, key, keyLen,
+                    WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                    &statsBuffer);
+            finishStats[id - 3] = *statsBuffer.getStart<PerfStats>();
+
+            double elapsedTime = static_cast<double>(finishStats[id -3].collectionTime -
+                    startStats[id - 3].collectionTime)/ finishStats[id - 3].cyclesPerSecond;
+            double rate = static_cast<double>(finishStats[id -3].readCount -
+                    startStats[id -3].readCount) / elapsedTime;
+            double utilization = static_cast<double>(
+                    finishStats[id -3].workerActiveCycles -
+                    startStats[id -3].workerActiveCycles) / static_cast<double>(
+                    finishStats[id -3].collectionTime - startStats[id -3].collectionTime);
+            double dispatchUtilization = static_cast<double>(
+                    finishStats[id -3].dispatchActiveCycles -
+                    startStats[id -3].dispatchActiveCycles) / static_cast<double>(
+                    finishStats[id -3].collectionTime - startStats[id -3].collectionTime);
+            printf("server %d %.0f %8.3f %8.3f\n",
+                    id -2, rate/1e03, utilization, dispatchUtilization);
+        }
+
+        sendCommand("done", "done", 1, numClients-1);
+
+    } else {
+
+        bool running = false;
+
+        uint64_t startTime;
+        bool firstRead = true;
+
+        Buffer input;
+
+        MultiReadObject requestObjects[objsPerMaster];
+        MultiReadObject* requests[objsPerMaster];
+        Tub<ObjectBuffer> values[objsPerMaster];
+        char keys[objsPerMaster][keyLength];
+
+
+        while (true) {
+            char command[20];
+
+            getCommand(command, sizeof(command), false);
+            if (strcmp(command, "run") == 0) {
+                if (!running) {
+                    setSlaveState("running");
+                    running = true;
+                    RAMCLOUD_LOG(NOTICE,
+                            "Starting multiReadThroughput benchmark");
+                }
+
+                startTime = Cycles::rdtsc();
+                uint64_t checkTime = startTime + Cycles::fromSeconds(1.0);
+                do {
+                    if (firstRead) {
+                        getTableIds(tableIds);
+                        for (int tableNum = 0; tableNum < 1; tableNum++) {
+                            for (int i = 0; i < objsPerMaster; i++) {
+                                Util::genRandomString(keys[i], keyLength);
+                                fillBuffer(input, dataLength, tableIds.at((clientIndex - 1)%numMasters),
+                                        keys[i], keyLength);
+
+                                // Write each object to the cluster
+                                cluster->write(tableIds.at((clientIndex - 1)%numMasters), keys[i], keyLength,
+                                        input.getRange(0, dataLength), dataLength);
+
+                                // Create read object corresponding to each object to be
+                                // used in the multiread request later.
+                                requestObjects[i] =
+                                        MultiReadObject(tableIds.at((clientIndex -1)%numMasters),
+                                        keys[i], keyLength, &values[i]);
+                                requests[i] = &requestObjects[i];
+                            }
+                        }
+                        // Scramble the requests. Checking code below it stays valid
+                        // since the value buffer is a pointer to a Buffer in the request.
+                        if (randomize) {
+                           // Candy: don't need randomize now
+                           // uint64_t numRequests = numMasters*objsPerMaster;
+                           // MultiReadObject** reqs = *requests;
+
+                           // for (uint64_t i = 0; i < numRequests; i++) {
+                           //     uint64_t rand = generateRandom() % numRequests;
+
+                           //     MultiReadObject* tmp = reqs[i];
+                           //     reqs[i] = reqs[rand];
+                           //     reqs[rand] = tmp;
+                           // }
+                        }
+
+                        cluster->multiRead(requests, objsPerMaster);
+                        firstRead = false;
+                    }
+
+                    cluster->multiRead(requests, objsPerMaster);
+
+                } while (Cycles::rdtsc() < checkTime);
+            } else if (strcmp(command, "done") == 0) {
+                setSlaveState("done");
+                RAMCLOUD_LOG(NOTICE, "Ending multiReadThroughput benchmark");
+                return;
+            } else {
+                RAMCLOUD_LOG(ERROR, "unknown command %s", command);
+                return;
+            }
+        }
+    }
+}
+
+
 /**
  * This method contains the core of all the "multiWrite" tests.
  * It writes objsPerMaster objects on numMasters servers.
@@ -3661,6 +3953,31 @@ multiRead_oneObjectPerMaster()
             1e06*latency, 1e06*latency/numMasters/objsPerMaster);
     }
 }
+
+void
+multiRead_noColocation()
+{
+    int dataLength = objectSize;
+    uint16_t keyLength = 30;
+
+    int objsPerMaster = numObjects;
+    int numMasters = numTables;
+
+    doMultiReadNoColocation(dataLength, keyLength, numMasters, objsPerMaster);
+}
+
+void
+multiRead_Colocation()
+{
+    int dataLength = objectSize;
+    uint16_t keyLength = 30;
+
+    int objsPerMaster = numObjects;
+    int numMasters = numTables;
+
+    doMultiReadColocation(dataLength, keyLength, numMasters, objsPerMaster);
+}
+
 
 // This benchmark measures the multiread times for objects on a single master
 // server.
@@ -6250,6 +6567,8 @@ TestInfo tests[] = {
     {"multiRead_oneObjectPerMaster", multiRead_oneObjectPerMaster},
     {"multiRead_general", multiRead_general},
     {"multiRead_generalRandom", multiRead_generalRandom},
+    {"multiRead_Colocation", multiRead_Colocation},
+    {"multiRead_noColocation", multiRead_noColocation},
     {"multiReadThroughput", multiReadThroughput},
     {"netBandwidth", netBandwidth},
     {"readAllToAll", readAllToAll},

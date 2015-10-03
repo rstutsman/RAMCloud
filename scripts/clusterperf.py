@@ -625,7 +625,9 @@ simple_tests = [
     Test("netBandwidth", netBandwidth),
     Test("readAllToAll", readAllToAll),
     Test("readNotFound", default),
-    Test("linearizableRpc", basic)
+    Test("linearizableRpc", basic),
+    Test("multiRead_Colocation", default),
+    Test("multiRead_noColocation", default)
 ]
 
 graph_tests = [
