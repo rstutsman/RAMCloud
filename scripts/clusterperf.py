@@ -115,7 +115,10 @@ def print_cdf_from_log(
     for line in open(globResult[0], 'r'):
         if not re.match('([0-9]+\.[0-9]+) ', line):
             for value in line.split(","):
-                numbers.append(float(value))
+                try:
+                    numbers.append(float(value))
+                except ValueError, e:
+                    print("Skipping, couldn't parse %s" % line)
 
     # Generate a CDF from the array.
     numbers.sort()
@@ -151,7 +154,10 @@ def print_rcdf_from_log(
     for line in open(globResult[0], 'r'):
         if not re.match('([0-9]+\.[0-9]+) ', line):
             for value in line.split(","):
-                numbers.append(float(value))
+                try:
+                    numbers.append(float(value))
+                except ValueError, e:
+                    print("Skipping, couldn't parse %s" % line)
 
     # Generate a RCDF from the array.
     numbers.sort()
@@ -219,6 +225,8 @@ def run_test(
         client_args['--numIndexes'] = options.numIndexes
     if options.numVClients != None:
         client_args['--numVClients'] = options.numVClients
+    if options.migratePercentage != None:
+        client_args['--migratePercentage'] = options.migratePercentage
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -747,7 +755,22 @@ if __name__ == '__main__':
     parser.add_option('--rcdf', action='store_true', default=False,
             dest='rcdf',
             help='Output reverse CDF data instead.')
+    parser.add_option('--parse', action='store_true', default=False,
+            dest='parse',
+            help='Just output CDF data from latest client log without running '
+            'anything.')
+    parser.add_option('--migratePercentage', type=int, dest='migratePercentage',
+            help='For readDistWorkload and writeDistWorkload, the percentage '
+                 'of the first table from migrate in the middle of the '
+                 'benchmark. If 0 (the default), then no migration is done.')
     (options, args) = parser.parse_args()
+
+    if options.parse:
+        if options.rcdf:
+            print_rcdf_from_log()
+        else:
+            print_cdf_from_log()
+        raise SystemExit()
 
     # Invoke the requested tests (run all of them if no tests were specified)
     try:

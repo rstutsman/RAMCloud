@@ -21,8 +21,10 @@
 
 #include "Common.h"
 
+#include "ClusterMetrics.h"
 #include "Context.h"
 #include "CycleCounter.h"
+#include "Cycles.h"
 #include "RamCloud.h"
 #include "OptionParser.h"
 #include "MasterClient.h"
@@ -106,6 +108,8 @@ try
 
     uint64_t otherTableId = client.createTable("junk");
     client.testingFill(otherTableId, "", 0, otherObjectCount, objectSize);
+    LOG(NOTICE, "- quiescing writes");
+    client.serverControlAll(WireFormat::ControlOp::QUIESCE);
 #endif
 
     LOG(ERROR, "Issuing migration request:");
@@ -114,16 +118,44 @@ try
     LOG(ERROR, "  last key  %lu", lastKey);
     LOG(ERROR, "  recipient master id %lu", newOwnerMasterId);
 
+    // Take an initial snapshot of performance metrics.
+    ClusterMetrics metricsBefore(&client);
+
+    double seconds = 0.0;
     {
         CycleCounter<> counter{};
         client.migrateTablet(tableId,
                              firstKey,
                              lastKey,
                              ServerId(newOwnerMasterId));
-        double seconds = Cycles::toSeconds(counter.stop());
-        LOG(ERROR, "Migration took %0.2f seconds", seconds);
-        LOG(ERROR, "Migration took %0.2f MB/s",
-                double(totalBytes) / seconds / double(1 << 20));
+        seconds = Cycles::toSeconds(counter.stop());
+    }
+
+    // Take another snapshot of performance metrics.
+    ClusterMetrics metricsAfter(&client);
+
+    LOG(ERROR, "Recovery completed in %lu ns, failure detected in "
+               "%lu ns", uint64_t(seconds * 1e9), 0lu);
+
+    LOG(ERROR, "Migration took %0.2f seconds", seconds);
+    LOG(ERROR, "Migration took %0.2f MB/s",
+            double(totalBytes) / seconds / double(1 << 20));
+
+    // Log the delta of the recovery time statistics
+    ClusterMetrics diff = metricsAfter.difference(metricsBefore);
+    if (metricsAfter.size() != diff.size()) {
+        LOG(ERROR, "Metrics mismatches: %lu",
+                metricsAfter.size() - diff.size());
+    }
+    for (ClusterMetrics::iterator serverIt = diff.begin();
+            serverIt != diff.end(); serverIt++) {
+        LOG(NOTICE, "Metrics: begin server %s", serverIt->first.c_str());
+        ServerMetrics &server = serverIt->second;
+        for (ServerMetrics::iterator metricIt = server.begin();
+                metricIt != server.end(); metricIt++) {
+            LOG(NOTICE, "Metrics: %s %lu", metricIt->first.c_str(),
+                    metricIt->second);
+        }
     }
 
 #if 0

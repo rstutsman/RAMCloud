@@ -128,6 +128,11 @@ uint64_t dataTable = -1;
 // and slaves to coordinate execution of tests.
 uint64_t controlTable = -1;
 
+// For readDistWorkload and writeDistWorkload, the percentage of the first
+// table from migrate in the middle of the benchmark. If 0 (the default),
+// then no migration is done.
+int migratePercentage = 0;
+
 #define MAX_METRICS 8
 
 // The following type holds metrics for all the clients.  Each inner vector
@@ -340,6 +345,20 @@ class WorkloadGenerator {
                 "Unknown workload type %s - Using default",
                 workloadName.c_str());
         }
+
+        if (numObjects != 1) {
+            recordCount = numObjects;
+        }
+
+        // All lines that don't start with 'x.x ' get parsed by the CDF
+        // generator.
+        RAMCLOUD_LOG(NOTICE, ">>> Workload: %s", workloadName.c_str());
+        RAMCLOUD_LOG(NOTICE, ">>> Record Count: %d", recordCount);
+        RAMCLOUD_LOG(NOTICE, ">>> Record Size: %d", recordSizeB);
+        RAMCLOUD_LOG(NOTICE, ">>> Total Table Size: %lu",
+               uint64_t(recordCount) * recordSizeB / (1lu << 20));
+        RAMCLOUD_LOG(NOTICE, ">>> Read Percentage: %d", readPercent);
+        RAMCLOUD_LOG(NOTICE, ">>> Migrate Percentage: %d", migratePercentage);
 
         generator.construct(recordCount);
     }
@@ -4542,9 +4561,13 @@ doWorkload(OpType type)
     uint64_t start = Cycles::rdtsc();
     uint64_t stop = 0;
 
+    Tub<MigrateTabletRpc> migration{};
+    uint64_t migrationStartCycles = 0;
+    uint64_t migrationCycles = 0;
     // Issue the reads back-to-back, and save the times.
     std::vector<uint64_t> ticks;
     ticks.resize(count);
+    int captured = 0;
     int i = 0;
     while (i < count) {
         // Generate random key.
@@ -4558,8 +4581,10 @@ doWorkload(OpType type)
             // Do read
             uint64_t start = Cycles::rdtsc();
             cluster->read(dataTable, key, keyLen, &readBuf);
-            ticks[i] = Cycles::rdtsc() - start;
+            ticks[captured] = Cycles::rdtsc() - start;
             if (type == READ_TYPE) {
+                if (!migratePercentage || migration)
+                    captured++;
                 i++;
             }
             readCount++;
@@ -4571,12 +4596,37 @@ doWorkload(OpType type)
                     loadGenerator.recordSizeB);
             ticks[i] = Cycles::rdtsc() - start;
             if (type == WRITE_TYPE) {
+                if (!migratePercentage || migration)
+                    captured++;
                 i++;
             }
             writeCount++;
         }
+
         opCount++;
         stop = Cycles::rdtsc();
+
+        // Stick a migration in the middle of the benchmark, if requested.
+        if (migratePercentage && !migrationCycles && i > 50000) {
+            if (!migration) {
+                RAMCLOUD_LOG(NOTICE, "Starting migration\n");
+                uint64_t endKeyHash = ~0lu;
+                if (migratePercentage < 100)
+                    endKeyHash = endKeyHash / 100 * migratePercentage;
+                migration.construct(cluster,
+                                    dataTable,
+                                    0,
+                                    endKeyHash,
+                                    ServerId(2, 0));
+                migrationStartCycles = Cycles::rdtsc();
+            } else if (migration->isReady()) {
+                migration->wait();
+                migrationCycles = Cycles::rdtsc() - migrationStartCycles;
+                double migrationS = Cycles::toSeconds(migrationCycles);
+                RAMCLOUD_LOG(NOTICE, "Migration took: %f s", migrationS);
+                migration.destroy();
+            }
+        }
 
         // throttle
         if (targetNSPO > 0) {
@@ -4625,7 +4675,7 @@ doWorkload(OpType type)
 
     // Output the times (several comma-separated values on each line).
     int valuesInLine = 0;
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < captured; i++) {
         if (valuesInLine >= 10) {
             valuesInLine = 0;
             printf("\n");
@@ -6644,7 +6694,12 @@ try
         ("numIndexlet", po::value<int>(&numIndexlet)->default_value(1),
                 "number of Indexlets")
         ("numIndexes", po::value<int>(&numIndexes)->default_value(1),
-                "number of secondary keys per object");
+                "number of secondary keys per object")
+        ("migratePercentage",
+                 po::value<int>(&migratePercentage)->default_value(0),
+                "For readDistWorkload and writeDistWorkload, the percentage "
+                "of the first table from migrate in the middle of the "
+                "benchmark. If 0 (the default), then no migration is done.");
     po::positional_options_description desc2;
     desc2.add("testName", -1);
     po::variables_map vm;
