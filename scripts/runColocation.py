@@ -64,11 +64,15 @@ if __name__ == '__main__':
         fp = os.popen(cmd)
         total = 0
         count = 0
-        for line in fp.readlines():
-            count = count + 1
-            total = total + int(line.split(" ")[2])
-        average = total/count
-        results.write("".join([str(average), "\n"]))
+        try:
+            for line in fp.readlines():
+                count = count + 1
+                total = total + int(line.split(" ")[2])
+            average = total/count
+            results.write("".join([str(average), "\n"]))
+        except ValueError, e:
+            print("Failure parsing: %s" % line)
+            raise e
 
     results.close()
 
