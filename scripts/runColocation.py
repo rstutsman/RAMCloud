@@ -3,18 +3,35 @@
 import os
 import sys
 from optparse import OptionParser
+import time
+import glob
+import re
 
-if __name__ == '__main__':
+def merge_results(outpath, files):
+    first = True
+    with open(outpath, 'w') as out:
+        for f in files:
+            with open(f, 'r') as inp:
+                lines = inp.readlines()
+                lines = [l.strip() for l in lines]
+                lines = [l for l in lines if re.match(r'[0-9]+\.[0-9]+ ', l) is None]
+                if first:
+                    first = False
+                else:
+                    lines = lines[1:]
+                out.write('\n'.join(lines) + '\n')
+
+def main():
     parser = OptionParser(description=
             'Run clusterperf.py N times, for colocation and no colocation read'
             'throughput tests respectively, from clients fetching 1 objects to'
             'N objects at a time. N equals the number of servers specified.',
             usage='%prog [options]',
             conflict_handler='resolve')
-    parser.add_option('--clients', type=int,
+    parser.add_option('--clients', type=int, default=40,
             metavar='N', dest='num_clients',
             help='Number of clients to generate read requests.')
-    parser.add_option('--servers', type=int,
+    parser.add_option('--servers', type=int, default=10,
             metavar='N', dest='num_servers',
             help='Number of servers.')
     parser.add_option('--size', type=int, default=100,
@@ -24,6 +41,7 @@ if __name__ == '__main__':
 
     if ops.num_clients == None or ops.num_servers == None:
         parser.error("must specify the number of clients and servers.")
+
 
     # The directory to store test results.
     colocation_test_dir = os.path.join(os.path.dirname(sys.argv[0]),
@@ -47,35 +65,6 @@ if __name__ == '__main__':
                      "--numTables", str(ops.num_servers),
                      "--size", str(ops.size)])
 
-    # Start "no colocation" tests.
-    # Create file used to store results of "no colocation" tests.
-    results_path = os.path.join(colocation_test_dir, "".join(["no_colocation_clients_",
-                                                              str(ops.num_clients),
-                                                              "_servers_",
-                                                              str(ops.num_servers),
-                                                              "_size_",
-                                                              str(ops.size)]))
-    results = open(results_path, "w")
-
-    # Run clusterperf.py from 1 objects to num_servers objects.
-    for i in range(1, ops.num_servers + 1):
-        cmd = " ".join([clusterperf_path, "multiRead_noColocation", args, "--numObjects", str(i)])
-        print cmd
-        fp = os.popen(cmd)
-        total = 0
-        count = 0
-        try:
-            for line in fp.readlines():
-                count = count + 1
-                total = total + int(line.split(" ")[2])
-            average = total/count
-            results.write("".join([str(average), "\n"]))
-        except ValueError, e:
-            print("Failure parsing: %s" % line)
-            raise e
-
-    results.close()
-
     # Start "colocation" tests.
     # Create file used to store results of "colocation" tests.
     results_path = os.path.join(colocation_test_dir, "".join(["colocation_clients_",
@@ -84,19 +73,25 @@ if __name__ == '__main__':
                                                               str(ops.num_servers),
                                                               "_size_",
                                                               str(ops.size)]))
-    results = open(results_path, "w")
 
-    # Run clusterperf.py from 1 objects to num_servers objects.
-    for i in range(1, ops.num_servers + 1):
-        cmd = " ".join([clusterperf_path, "multiRead_colocation", args, "--numObjects", str(i)])
-        print cmd
-        fp = os.popen(cmd)
-        total = 0
-        count = 0
-        for line in fp.readlines():
-            count = count + 1
-            total = total + int(line.split(" ")[2])
-        average = total/count
-        results.write("".join([str(average), "\n"]))
+    results_files = []
+    for ops in range(1, ops.num_servers + 1):
+        for span in range(0, ops):
+            cmd = " ".join([clusterperf_path,
+                            "multiRead_colocation", args,
+                            "--numObjects", str(ops),
+                            '--spannedOps', str(span)])
+            print cmd
+            fp = os.popen(cmd)
+            fp.readlines()
+            result = os.readlink('logs/latest')
+            result = glob.glob('logs/%s/client1.*.log' % result)[0]
+            print(result)
+            results_files.append(result)
 
-    results.close()
+    print(results_files)
+    merge_results(results_path, results_files)
+    print('Wrote results to %s' % results_path)
+
+if __name__ == '__main__':
+    main()
