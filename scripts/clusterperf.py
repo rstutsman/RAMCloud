@@ -225,6 +225,8 @@ def run_test(
         client_args['--numIndexes'] = options.numIndexes
     if options.numVClients != None:
         client_args['--numVClients'] = options.numVClients
+    if options.spannedOps != None:
+        client_args['--spannedOps'] = options.spannedOps
     if options.migratePercentage != None:
         client_args['--migratePercentage'] = options.migratePercentage
     test.function(test.name, options, cluster_args, client_args)
@@ -634,8 +636,7 @@ simple_tests = [
     Test("readAllToAll", readAllToAll),
     Test("readNotFound", default),
     Test("linearizableRpc", basic),
-    Test("multiRead_Colocation", default),
-    Test("multiRead_noColocation", default)
+    Test("multiRead_colocation", default),
 ]
 
 graph_tests = [
@@ -759,6 +760,11 @@ if __name__ == '__main__':
             dest='parse',
             help='Just output CDF data from latest client log without running '
             'anything.')
+    parser.add_option('--spannedOps', type=int, dest='spannedOps',
+            help='For multiread_colocation, number objects of numObjects '
+                 'that will be drawn from tables other than the rest of the'
+                 'multiread. If 0, then all gets in a multiread go to the '
+                 'same table')
     parser.add_option('--migratePercentage', type=int, dest='migratePercentage',
             help='For readDistWorkload and writeDistWorkload, the percentage '
                  'of the first table from migrate in the middle of the '

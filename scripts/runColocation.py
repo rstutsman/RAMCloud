@@ -88,7 +88,7 @@ if __name__ == '__main__':
 
     # Run clusterperf.py from 1 objects to num_servers objects.
     for i in range(1, ops.num_servers + 1):
-        cmd = " ".join([clusterperf_path, "multiRead_Colocation", args, "--numObjects", str(i)])
+        cmd = " ".join([clusterperf_path, "multiRead_colocation", args, "--numObjects", str(i)])
         print cmd
         fp = os.popen(cmd)
         total = 0
