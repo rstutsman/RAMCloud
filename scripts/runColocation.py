@@ -28,7 +28,7 @@ def main():
             'N objects at a time. N equals the number of servers specified.',
             usage='%prog [options]',
             conflict_handler='resolve')
-    parser.add_option('--clients', type=int, default=40,
+    parser.add_option('--clients', type=int, default=20,
             metavar='N', dest='num_clients',
             help='Number of clients to generate read requests.')
     parser.add_option('--servers', type=int, default=10,
@@ -63,7 +63,8 @@ def main():
     args = " ".join(["--clients", str(ops.num_clients),
                      "--servers", str(ops.num_servers),
                      "--numTables", str(ops.num_servers),
-                     "--size", str(ops.size)])
+                     "--size", str(ops.size),
+                     "--disjunct"])
 
     # Start "colocation" tests.
     # Create file used to store results of "colocation" tests.

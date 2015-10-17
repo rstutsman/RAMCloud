@@ -53,6 +53,7 @@ namespace po = boost::program_options;
 #include "PerfStats.h"
 #include "IndexLookup.h"
 #include "RamCloud.h"
+#include "MultiRead.h"
 #include "Util.h"
 #include "TimeTrace.h"
 #include "Transaction.h"
@@ -2182,7 +2183,7 @@ doMultiReadColocation(
                 double(end.dispatchActiveCycles - start.dispatchActiveCycles) /
                 double(cycles);
 
-            printf("%d %.0f %8.3f %8.3f %d %d\n",
+            printf("%lu %.0f %8.3f %8.3f %d %d\n",
                     i, rate, utilization, dispatchUtilization,
                     numObjects, spannedOps);
         }
@@ -2202,31 +2203,38 @@ doMultiReadColocation(
 
         getTableIds(tableIds);
 
-        MultiReadObject requestObjects[objsPerMaster];
-        MultiReadObject* requests[objsPerMaster];
-        Tub<ObjectBuffer> values[objsPerMaster];
+        static const size_t atATime = 16;
+
         uint64_t keys[objsPerMaster];
+        MultiReadObject requestObjects[atATime][objsPerMaster];
+        MultiReadObject* requests[atATime][objsPerMaster];
+        Tub<ObjectBuffer> values[atATime][objsPerMaster];
 
         // Create read object corresponding to each object to be
         // used in the multiread request later.
-        for (uint64_t key  = 0; key < uint64_t(objsPerMaster); ++key) {
-            keys[key] = key;
+        for (uint64_t instance = 0; instance < atATime; ++instance) {
+            for (uint64_t key  = 0; key < uint64_t(objsPerMaster); ++key) {
+                keys[key] = key;
 
-            uint64_t tableIndex = clientIndex - 1;
-            if (key < uint64_t(spannedOps))
-                tableIndex += (key + 1);
-            tableIndex %= numMasters;
-            uint64_t tableId = tableIds[tableIndex];
+                uint64_t tableIndex = clientIndex - 1;
+                if (key < uint64_t(spannedOps))
+                    tableIndex += (key + 1);
+                tableIndex %= numMasters;
+                uint64_t tableId = tableIds[tableIndex];
 
-            requestObjects[key] =
-                MultiReadObject(
-                        tableId,
-                        &keys[key],
-                        sizeof(key),
-                        &values[key]);
-            requests[key] = &requestObjects[key];
+                requestObjects[instance][key] =
+                    MultiReadObject(
+                            tableId,
+                            &keys[key],
+                            sizeof(key),
+                            &values[instance][key]);
+                requests[instance][key] = &requestObjects[instance][key];
+            }
         }
 
+        Tub<MultiRead> multiReads[atATime]{};
+
+        size_t instance = 0;
         while (true) {
             getCommand(command, sizeof(command), false);
             if (strcmp(command, "run") == 0) {
@@ -2234,7 +2242,17 @@ doMultiReadColocation(
                     Cycles::rdtsc() + Cycles::fromSeconds(1.0);
 
                 do {
-                    cluster->multiRead(requests, objsPerMaster);
+                    Tub<MultiRead>& op = multiReads[instance];
+                    if (!op) {
+                        op.construct(cluster,
+                                     &requests[instance][0],
+                                     uint32_t(objsPerMaster));
+                    } else if (op->isReady()) {
+                        op->wait();
+                        op.destroy();
+                    }
+                    cluster->poll();
+                    instance = (instance + 1) % atATime;
                 } while (Cycles::rdtsc() < checkTime);
             } else if (strcmp(command, "done") == 0) {
                 setSlaveState("done");
