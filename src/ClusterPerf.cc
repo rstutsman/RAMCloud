@@ -4340,6 +4340,62 @@ doShuffleValues(int numIter, int selectivity, int numMasters, int objsPerMaster)
     return cumulativeElapsed;
 }
 
+/**
+ * Used in doWorkload to capture information about probe reads. This
+ * information can be dumped at the end of benchmarking and parsed
+ * to generate latency CDFs and more.
+ */
+struct Sample {
+    uint64_t startTicks;
+    uint64_t endTicks;
+    uint64_t table;
+    bool type;
+
+    /// Create a sample and capture all of its parameters.
+    Sample(uint64_t startTicks,
+           uint64_t endTicks,
+           uint64_t table,
+           bool type)
+        : startTicks{startTicks}
+        , endTicks{endTicks}
+        , table{table}
+        , type{type}
+    {}
+
+    /**
+     * Dump a R read.table compatible header that matches the format of each
+     * sample dumped by Dump().
+     */
+    static void DumpHeader() {
+        printf(">>> startNs endNs durationNs table isWrite\n");
+    }
+
+    /**
+     * Dump this sample to stdout subtracting an experiment start time
+     * from each of its samples, so that results look zero-based from the start
+     * of the run.
+     */
+    void Dump(uint64_t experimentStartTicks) const {
+        uint64_t startNs =
+            Cycles::toNanoseconds(startTicks - experimentStartTicks);
+        uint64_t endNs =
+            Cycles::toNanoseconds(endTicks - experimentStartTicks);
+        printf(">>> %lu %lu %lu %lu %d\n",
+                startNs, endNs, endNs - startNs, table, type);
+    }
+};
+
+/**
+ * Dump out a vector of samples and a R read.table compatible header.
+ */
+template <typename T>
+void dumpSamples(const vector<T>& samples, uint64_t experimentStartTime)
+{
+    T::DumpHeader();
+    foreach (const auto& sample, samples)
+        sample.Dump(experimentStartTime);
+}
+
 enum OpType{ READ_TYPE, WRITE_TYPE };
 /**
  * Run a specified workload and measure the latencies of the specified opType.
@@ -4418,10 +4474,12 @@ doWorkload(OpType type)
     Tub<MigrateTabletRpc> migration{};
     uint64_t migrationStartCycles = 0;
     uint64_t migrationCycles = 0;
+
     // Issue the reads back-to-back, and save the times.
-    std::vector<uint64_t> ticks;
-    ticks.resize(count);
-    int captured = 0;
+    std::vector<Sample> samples{};
+    samples.reserve(count);
+
+    const uint64_t experimentStartTicks = Cycles::rdtsc();
     int i = 0;
     while (i < count) {
         // Generate random key.
@@ -4435,10 +4493,8 @@ doWorkload(OpType type)
             // Do read
             uint64_t start = Cycles::rdtsc();
             cluster->read(dataTable, key, keyLen, &readBuf);
-            ticks[captured] = Cycles::rdtsc() - start;
             if (type == READ_TYPE) {
-                if (!migratePercentage || migration)
-                    captured++;
+                samples.emplace_back(start, Cycles::rdtsc(), dataTable, 0);
                 i++;
             }
             readCount++;
@@ -4448,10 +4504,8 @@ doWorkload(OpType type)
             uint64_t start = Cycles::rdtsc();
             cluster->write(dataTable, key, keyLen, value,
                     loadGenerator.recordSizeB);
-            ticks[i] = Cycles::rdtsc() - start;
             if (type == WRITE_TYPE) {
-                if (!migratePercentage || migration)
-                    captured++;
+                samples.emplace_back(start, Cycles::rdtsc(), dataTable, 1);
                 i++;
             }
             writeCount++;
@@ -4527,22 +4581,7 @@ doWorkload(OpType type)
 
     printf("0.0 Max Throughput: %.0f ops\n", rate);
 
-    // Output the times (several comma-separated values on each line).
-    int valuesInLine = 0;
-    for (int i = 0; i < captured; i++) {
-        if (valuesInLine >= 10) {
-            valuesInLine = 0;
-            printf("\n");
-        }
-        if (valuesInLine != 0) {
-            printf(",");
-        }
-        double micros = Cycles::toSeconds(ticks[i])*1.0e06;
-        printf("%.2f", micros);
-        valuesInLine++;
-    }
-    printf("\n");
-    #undef NUM_KEYS
+    dumpSamples(samples, experimentStartTicks);
 
     // Wait for slaves to exit.
     sendCommand(NULL, "done", 1, numClients-1);
