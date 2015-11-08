@@ -190,6 +190,36 @@ def print_samples_from_log(
         if re.match(leader, line):
             print(line[n:].strip())
 
+def print_rcdf_from_log_samples(
+        index = 1                 # Client index (1 for first client,
+                                  # which is usually the one that's wanted)
+        ):
+    # Read the log file into an array of numbers.
+    numbers = []
+    globResult = glob.glob('%s/latest/client%d.*.log' %
+            (options.log_dir, index))
+    if len(globResult) == 0:
+        raise Exception("couldn't find log file for client %d" % (index))
+    leader = '>>> '
+    n = len(leader)
+    for line in open(globResult[0], 'r'):
+        if re.match(leader, line):
+            line = line[n:].strip()
+            durationNs = line.split(' ')[2]
+            try:
+                numbers.append(float(durationNs))
+            except ValueError, e:
+                print("Skipping, couldn't parse %s" % line, file=sys.stderr)
+
+    # Generate a RCDF from the array.
+    numbers.sort()
+    result = []
+    print("%8.2f    %11.6f" % (numbers[0], 1.0))
+    for i in range(1, len(numbers)-1):
+        if (numbers[i] != numbers[i-1] or numbers[i] != numbers[i+1]):
+            print("%8.2f    %11.6f" % (numbers[i], 1-(i/len(numbers))))
+    print("%8.2f    %11.6f" % (numbers[-1], 1/len(numbers)))
+
 def run_test(
         test,                     # Test object describing the test to run.
         options                   # Command-line options.
@@ -251,6 +281,8 @@ def run_test(
         client_args['--spannedOps'] = options.spannedOps
     if options.migratePercentage != None:
         client_args['--migratePercentage'] = options.migratePercentage
+    if options.quiet:
+        client_args['--quiet'] = ''
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -630,7 +662,10 @@ def workloadDist(name, options, cluster_args, client_args):
         cluster.run(client='%s/ClusterPerf %s %s' %
                 (obj_path,  flatten_args(client_args), name),
                 **cluster_args)
-    print_samples_from_log()
+    if options.rcdf:
+        print_rcdf_from_log_samples()
+    else:
+        print_samples_from_log()
 
 #-------------------------------------------------------------------
 #  End of driver functions.
@@ -787,6 +822,9 @@ if __name__ == '__main__':
             action='store_true', default=False, dest='extract',
             help='For some experiments skip re-running, just parse the '
                  'latest output file and dump the results.')
+    parser.add_option('--quiet', action='store_true', default=False,
+            dest='quiet',
+            help='Supress stat output and just run load.')
     (options, args) = parser.parse_args()
 
     if options.parse:
