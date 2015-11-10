@@ -1033,6 +1033,8 @@ TableManager::createTable(const Lock& lock, const char* name,
                                 tabletMaster, {WireFormat::MASTER_SERVICE});
                 tabletMaster = currentTabletMaster;
             }
+			//printf("###Creating table '%s' with id %lu", name, tableId);
+			LOG(NOTICE, "###serverId: %lu \n", currentTabletMaster.getId());
             if (!currentTabletMaster.isValid()) {
                 // The server list contains no functioning masters! Ask the
                 // client to retry, and hope that eventually a master joins

@@ -58,6 +58,9 @@ namespace po = boost::program_options;
 #include "TimeTrace.h"
 #include "Transaction.h"
 
+#include "ObjectFinder.h"
+#include "PingClient.h"
+
 using namespace RAMCloud;
 
 // Shared state for client library.
@@ -122,6 +125,9 @@ static int targetOps;
 // the server span of a transaction.
 static int txSpan;
 
+//Value of the "--servers"
+static int numServers;
+
 // Identifier for table that is used for test-specific data.
 uint64_t dataTable = -1;
 
@@ -134,6 +140,17 @@ uint64_t controlTable = -1;
 // then no migration is done.
 int migratePercentage = 0;
 
+string coordinatorLocator;
+
+std::vector<uint64_t> dataTables;
+
+std::vector<uint64_t> dummyDataTables;
+
+int dataTablesNum = -1;//25;
+
+ServerId emptyServerId;
+
+//int numServers = 6;
 // For multiread_colocation. Number of accesses (out of numObjects) that
 // will be read from different servers than the reset.
 // That is, spannedOps + 1  servers will be accessed per multiread.
@@ -385,41 +402,45 @@ class WorkloadGenerator {
         char* charValues = new char[BATCH_SIZE * recordSizeB];
         memset(charValues, 0, BATCH_SIZE * recordSizeB);
 
-        uint64_t i, j;
-        for (i = 0; i < static_cast<uint64_t>(recordCount); i++) {
-            j = i % BATCH_SIZE;
+        
+		for(int t = 0; t < dataTablesNum; ++t) {
+			uint64_t i, j;
+			for (i = 0; i < static_cast<uint64_t>(recordCount); i++) {
+					j = i % BATCH_SIZE;
 
-            char* key = keys + j * keyLength;
-            char* value = charValues + j * recordSizeB;
-            string("workload").copy(key, 8);
-            *reinterpret_cast<uint64_t*>(key + 8) = i;
+					char* key = keys + j * keyLength;
+					char* value = charValues + j * recordSizeB;
+					string("workload").copy(key, 8);
+					*reinterpret_cast<uint64_t*>(key + 8) = i;
 
-            Util::genRandomString(value, recordSizeB);
-            objects[j] = new MultiWriteObject(dataTable, key, keyLength, value,
-                    recordSizeB);
+					Util::genRandomString(value, recordSizeB);
+					objects[j] = new MultiWriteObject(dataTables[t], key, keyLength, value,
+									recordSizeB);
+					//objects[j] = new MultiWriteObject(dataTable, key, keyLength, value,
+					//        recordSizeB);
 
-            // Do the write and recycle the objects
-            if (j == BATCH_SIZE - 1) {
-                cluster->multiWrite(objects, BATCH_SIZE);
+					// Do the write and recycle the objects
+					if (j == BATCH_SIZE - 1) {
+							cluster->multiWrite(objects, BATCH_SIZE);
 
-                // Clean up the actual MultiWriteObjects
-                for (int k = 0; k < BATCH_SIZE; k++)
-                    delete objects[k];
+							// Clean up the actual MultiWriteObjects
+							for (int k = 0; k < BATCH_SIZE; k++)
+									delete objects[k];
 
-                memset(keys, 0, BATCH_SIZE * keyLength);
-                memset(charValues, 0, BATCH_SIZE * recordSizeB);
-            }
-        }
+							memset(keys, 0, BATCH_SIZE * keyLength);
+							memset(charValues, 0, BATCH_SIZE * recordSizeB);
+					}
+			}
+			// Do the last partial batch and clean up, if it exists.
+			j = i % BATCH_SIZE;
+			if (j < BATCH_SIZE - 1) {
+					cluster->multiWrite(objects, static_cast<uint32_t>(j));
 
-        // Do the last partial batch and clean up, if it exists.
-        j = i % BATCH_SIZE;
-        if (j < BATCH_SIZE - 1) {
-            cluster->multiWrite(objects, static_cast<uint32_t>(j));
-
-            // Clean up the actual MultiWriteObjects
-            for (uint64_t k = 0; k < j; k++)
-                delete objects[k];
-        }
+					// Clean up the actual MultiWriteObjects
+					for (uint64_t k = 0; k < j; k++)
+							delete objects[k];
+			}
+		}
 
         delete[] keys;
         delete[] charValues;
@@ -467,13 +488,15 @@ class WorkloadGenerator {
                 // Perform Operation
                 if (generateRandom() <= readThreshold) {
                     // Do read
-                    cluster->read(dataTable, key, keyLen, &readBuf);
-                    readCount++;
+                    //cluster->read(dataTable, key, keyLen, &readBuf);
+                    cluster->read(dataTables[0], key, keyLen, &readBuf);
+					readCount++;
                 } else {
                     // Do write
                     Util::genRandomString(value, recordSizeB);
-                    cluster->write(dataTable, key, keyLen, value, recordSizeB);
-                    writeCount++;
+                    //cluster->write(dataTable, key, keyLen, value, recordSizeB);
+                    cluster->write(dataTables[0], key, keyLen, value, recordSizeB);
+					writeCount++;
                 }
                 opCount++;
                 stop = Cycles::rdtsc();
@@ -1593,6 +1616,72 @@ createTables(std::vector<uint64_t> &tableIds, int objectSize, const void* key,
         fillBuffer(data, objectSize, tableIds.at(i), key, keyLength);
         cluster->write(tableIds.at(i), key, keyLength,
                 data.getRange(0, objectSize), objectSize);
+    }
+}
+
+void
+dropTables(std::vector<uint64_t> &tableIds)
+{
+    for (int i = downCast<int>(tableIds.size())-1; i >= 0;  i--) {
+        char tableName[20];
+        snprintf(tableName, sizeof(tableName), "table%d", i);
+        cluster->dropTable(tableName);
+    }
+}
+
+void
+createTablesDummy(std::vector<uint64_t> &tableIds, std::vector<uint64_t> &dummyTableIds, 
+					int objectSize, const void* key, uint16_t keyLength)
+{
+    // Create the tables in backwards order to reduce possible correlations
+    // between clients, tables, and servers (if we have 60 clients and 60
+    // servers, with clients and servers colocated and client i accessing
+    // table i, we wouldn't want each client reading a table from the
+    // server on the same machine).
+    //int tablesNumPerServer = dataTablesNum / (numServers - 1);
+    //dummyTableIds.assign(tablesNumPerServer, -1);
+	//printf("dummyTableIds.size(), %d", int(dummyTableIds.size()));
+	for (int i = dataTablesNum - 1; i >= 0;  i--) {
+        //printf("i: %d \n", i);
+		char tableName[20];
+        snprintf(tableName, sizeof(tableName), "table%d", i);
+        cluster->createTable(tableName);
+        tableIds.at(i) = cluster->getTableId(tableName);
+        Buffer data;
+        fillBuffer(data, objectSize, tableIds.at(i), key, keyLength);
+        cluster->write(tableIds.at(i), key, keyLength,
+                data.getRange(0, objectSize), objectSize);
+ 		if(i % (numServers - 1) == 0) {
+			char tableNameDummy[20];
+    	    snprintf(tableNameDummy, sizeof(tableNameDummy), "tableDummy%d", 
+					i / (numServers - 1));
+    	    cluster->createTable(tableNameDummy);
+    	   	//printf("i / tablesNumPerServer, %d \n", i / tablesNumPerServer);
+			dummyTableIds.at(i / (numServers - 1)) = cluster->getTableId(tableNameDummy);
+    	   // dummyTableIds.push_back(cluster->getTableId(tableNameDummy));
+			Buffer dataDummy;
+    	    fillBuffer(dataDummy, objectSize, dummyTableIds.at(i / (numServers - 1)), key, keyLength);
+    	    cluster->write(dummyTableIds.at(i / (numServers - 1)), key, keyLength,
+    	            dataDummy.getRange(0, objectSize), objectSize);
+ 		}
+    }
+}
+
+void
+dropTablesDummy(std::vector<uint64_t> &tableIds) 
+{
+    int tablesNumPerServer = dataTablesNum / (numServers - 1);
+	for (int i = dataTablesNum - 1; i >= 0;  i--) {
+        //printf("i: %d \n", i);
+		char tableName[20];
+        snprintf(tableName, sizeof(tableName), "table%d", i);
+        cluster->dropTable(tableName);
+ 		if(i % (numServers - 1) == 0) {
+			char tableNameDummy[20];
+    	    snprintf(tableNameDummy, sizeof(tableNameDummy), "tableDummy%d", 
+					i / tablesNumPerServer);
+    	    cluster->dropTable(tableNameDummy);
+ 		}
     }
 }
 
@@ -4383,6 +4472,13 @@ struct Sample {
         printf(">>> %lu %lu %lu %lu %d\n",
                 startNs, endNs, endNs - startNs, table, type);
     }
+
+	// void Dump(uint64_t experimentStartTicks) const {
+    //    uint64_t startNs = startTicks - experimentStartTicks;
+    //    uint64_t endNs = endTicks - experimentStartTicks;
+    //    printf(">>> %lu %lu %lu %lu %d\n",
+    //            startNs, endNs, endNs - startNs, table, type);
+    //}
 };
 
 /**
@@ -4394,6 +4490,41 @@ void dumpSamples(const vector<T>& samples, uint64_t experimentStartTime)
     T::DumpHeader();
     foreach (const auto& sample, samples)
         sample.Dump(experimentStartTime);
+}
+
+void migrateScaleupThread(const std::vector<uint64_t> &tableIds, uint64_t firstKeyHash, uint64_t lastKeyHash, 
+            			 ServerId newMasterOwnerId, uint64_t experimentStartTicks, bool &migDone)
+{
+	printf("Sleeping before migration... \n");
+	printf("<<<< %lu \n", Cycles::toNanoseconds(Cycles::rdtsc()
+												 - experimentStartTicks));
+	Cycles::sleep(5000000);
+	//printf("Migration scaleup thread starting... \n");
+	//printf("emptyServerId: %lu \n", emptyServerId.getId());
+	RamCloud r{coordinatorLocator.c_str()};
+	if(lastKeyHash != 0) {
+		uint64_t migrationStartCycles = Cycles::rdtsc() - experimentStartTicks;
+		printf("Migration starting... \n");
+		printf("<<< %lu \n", Cycles::toNanoseconds(migrationStartCycles));
+		for(int t = 0; t < numServers - 1; ++t)
+			r.migrateTablet(tableIds[t], firstKeyHash, lastKeyHash, newMasterOwnerId);
+		//r.migrateTablet(tableIds[0], firstKeyHash, lastKeyHash, newMasterOwnerId);
+		printf("Migration finishes. \n");
+		uint64_t migrationFinishCycles = Cycles::rdtsc() - experimentStartTicks;
+		printf("<<< %lu \n", Cycles::toNanoseconds(migrationFinishCycles));
+		uint64_t migrationCycles = migrationFinishCycles - migrationStartCycles;
+		double migrationS = Cycles::toSeconds(migrationCycles);
+		printf("Migration took: %f s \n", migrationS);
+		double migThroughput = objectSize * numObjects * (numServers - 1)
+								 / migrationS / 1000000;
+		printf("Migration throughput: %f MBs \n", migThroughput);
+	}       
+	Cycles::sleep(5000000);
+	printf("Sleeping after migration. \n");	
+	printf("<<<< %lu \n", Cycles::toNanoseconds(Cycles::rdtsc()
+												 - experimentStartTicks));
+	migDone = true;
+	//printf("migDone in thread: %d \n", migDone);
 }
 
 enum OpType{ READ_TYPE, WRITE_TYPE };
@@ -4440,9 +4571,12 @@ doWorkload(OpType type)
 
     // Begin counter collection on the server side.
     memset(key, 0, keyLen);
-    cluster->objectServerControl(dataTable, key, keyLen,
-                            WireFormat::START_PERF_COUNTERS);
-
+    //cluster->objectServerControl(dataTable, key, keyLen,
+    //                        WireFormat::START_PERF_COUNTERS);
+	for(int t = 0; t < dataTablesNum; ++t) {
+		cluster->objectServerControl(dataTables[t], key, keyLen,
+                            		WireFormat::START_PERF_COUNTERS);
+	}
     // Force serialization so that writing interferes less with the read
     // benchmark.
     Util::serialize();
@@ -4461,40 +4595,54 @@ doWorkload(OpType type)
 
     string("workload").copy(key, 8);
     *reinterpret_cast<uint64_t*>(key + 8) = 0;
-    Buffer statsBuffer;
-    cluster->objectServerControl(dataTable, key, keyLen,
-                    WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
-                    &statsBuffer);
-    PerfStats startStats = *statsBuffer.getStart<PerfStats>();
+    std::vector<PerfStats> startStatsVec;
+	for(int t = 0; t < dataTablesNum; ++t) {
+		Buffer statsBuffer;
+		cluster->objectServerControl(dataTables[t], key, keyLen,
+                    			     WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                   				     &statsBuffer);
+		startStatsVec.push_back(*statsBuffer.getStart<PerfStats>());
+	}
 
     uint64_t nextStop = 0;
     uint64_t start = Cycles::rdtsc();
     uint64_t stop = 0;
 
-    Tub<MigrateTabletRpc> migration{};
-    uint64_t migrationStartCycles = 0;
-    uint64_t migrationCycles = 0;
+	bool migDone = false;
+	std::thread migThread;
 
     // Issue the reads back-to-back, and save the times.
     std::vector<Sample> samples{};
     samples.reserve(count);
 
-    const uint64_t experimentStartTicks = Cycles::rdtsc();
-    int i = 0;
-    while (i < count) {
+	const uint64_t experimentStartTicks = Cycles::rdtsc();
+	uint64_t endKeyHash = ~0lu;
+    if (migratePercentage < 100)
+    	endKeyHash = endKeyHash / 100 * migratePercentage;
+	migThread = std::thread(migrateScaleupThread,
+                          dataTables,
+    					  0,
+                          endKeyHash,
+    					  emptyServerId,
+						  experimentStartTicks,
+    					  std::ref(migDone));
+    
+	int i = 0;
+	while (!migDone) {
         // Generate random key.
         memset(key, 0, keyLen);
         string("workload").copy(key, 8);
-        *reinterpret_cast<uint64_t*>(key + 8) =
-                loadGenerator.generator->nextNumber();
-
-        // Perform Operation
+        *reinterpret_cast<uint64_t*>(key + 8) = 
+								loadGenerator.generator->nextNumber();
+		int tableGenId = i % dataTablesNum;
+		// Perform Operation
         if (generateRandom() <= readThreshold) {
             // Do read
             uint64_t start = Cycles::rdtsc();
-            cluster->read(dataTable, key, keyLen, &readBuf);
-            if (type == READ_TYPE) {
-                samples.emplace_back(start, Cycles::rdtsc(), dataTable, 0);
+            //cluster->read(dataTable, key, keyLen, &readBuf);
+            cluster->read(dataTables[tableGenId], key, keyLen, &readBuf);
+			if (type == READ_TYPE) {
+                samples.emplace_back(start, Cycles::rdtsc(), dataTables[tableGenId], 0);
                 i++;
             }
             readCount++;
@@ -4502,10 +4650,12 @@ doWorkload(OpType type)
             // Do write
             Util::genRandomString(value, loadGenerator.recordSizeB);
             uint64_t start = Cycles::rdtsc();
-            cluster->write(dataTable, key, keyLen, value,
+            //cluster->write(dataTable, key, keyLen, value,
+            //        loadGenerator.recordSizeB);
+            cluster->write(dataTables[tableGenId], key, keyLen, value,
                     loadGenerator.recordSizeB);
-            if (type == WRITE_TYPE) {
-                samples.emplace_back(start, Cycles::rdtsc(), dataTable, 1);
+			 if (type == WRITE_TYPE) {
+                samples.emplace_back(start, Cycles::rdtsc(), dataTables[tableGenId], 1);
                 i++;
             }
             writeCount++;
@@ -4513,30 +4663,8 @@ doWorkload(OpType type)
 
         opCount++;
         stop = Cycles::rdtsc();
-
-        // Stick a migration in the middle of the benchmark, if requested.
-        if (migratePercentage && !migrationCycles && i > 50000) {
-            if (!migration) {
-                RAMCLOUD_LOG(NOTICE, "Starting migration\n");
-                uint64_t endKeyHash = ~0lu;
-                if (migratePercentage < 100)
-                    endKeyHash = endKeyHash / 100 * migratePercentage;
-                migration.construct(cluster,
-                                    dataTable,
-                                    0,
-                                    endKeyHash,
-                                    ServerId(2, 0));
-                migrationStartCycles = Cycles::rdtsc();
-            } else if (migration->isReady()) {
-                migration->wait();
-                migrationCycles = Cycles::rdtsc() - migrationStartCycles;
-                double migrationS = Cycles::toSeconds(migrationCycles);
-                RAMCLOUD_LOG(NOTICE, "Migration took: %f s", migrationS);
-                migration.destroy();
-            }
-        }
-
-        // throttle
+              
+   // throttle
         if (targetNSPO > 0) {
             nextStop = start +
                        Cycles::fromNanoseconds(
@@ -4551,35 +4679,64 @@ doWorkload(OpType type)
         }
     }
 
-    cluster->objectServerControl(dataTable, key, keyLen,
-            WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
-            &statsBuffer);
-    PerfStats finishStats = *statsBuffer.getStart<PerfStats>();
-    double elapsedTime = static_cast<double>(finishStats.collectionTime -
-            startStats.collectionTime)/ finishStats.cyclesPerSecond;
-    double rate = static_cast<double>(finishStats.readCount +
-            finishStats.writeCount -
-            startStats.readCount -
-            startStats.writeCount) / elapsedTime;
+	migThread.join();
+	printf("migDone time: %lu \n", Cycles::toNanoseconds(Cycles::rdtsc() 
+														 - experimentStartTicks));
+	printf("migDone: %d \n", migDone);
 
-    LogLevel ll = NOTICE;
-    if (targetMissCount > 0) {
-        ll = WARNING;
-    }
-    RAMCLOUD_LOG(ll,
-            "Actual OPS %.0f / Target OPS %lu",
-            static_cast<double>(opCount) /
-            static_cast<double>(Cycles::toSeconds(stop - start)),
-            static_cast<uint64_t>(targetOps));
-    RAMCLOUD_LOG(ll,
-            "%lu Misses / %lu Total -- %lu/%lu R/W",
-            targetMissCount, opCount, readCount, writeCount);
+    for(int t = 0; t < dataTablesNum; ++t) {
+		Buffer finishBuffer;
+		cluster->objectServerControl(dataTables[t], key, keyLen,
+                    			     WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                   				     &finishBuffer);
+		PerfStats finishStats = *finishBuffer.getStart<PerfStats>();
+		double elapsedTime = static_cast<double>(finishStats.collectionTime -
+						startStatsVec[t].collectionTime)/ finishStats.cyclesPerSecond;
+		double rate = static_cast<double>(finishStats.readCount +
+						finishStats.writeCount -
+						startStatsVec[t].readCount -
+						startStatsVec[t].writeCount) / elapsedTime;
+
+		printf("Data table %lu \n", dataTables[t]);
+	
+		printf("0.0 Max Throughput: %.0f ops\n", rate);
+	}
+
+	if (clientIndex == 0) {
+		const uint16_t keyLen = 0;
+		char key[keyLen];
+		//char value[objectSize];
+		ObjectFinder objectFinder(&context);
+
+		for(int t = 0; t < dataTablesNum; ++t)
+		{
+			printf("dataTables: %lu \n", dataTables[t]);
+			//cluster->write(dataTables[t], key, keyLen, value, objectSize);
+			Transport::SessionRef sessionIth = objectFinder.lookup(dataTables[t], key, keyLen);
+			ServerId serverIdIth = PingClient::getServerId(&context, sessionIth);
+			printf("serverId: %lu \n", serverIdIth.getId());
+		}
+	}
 
     // Stop slaves.
-    cluster->dropTable("data");
+    dropTablesDummy(dataTables);
+	//cluster->dropTable("data");
     sendCommand("done", NULL, 1, numClients-1);
-
-    printf("0.0 Max Throughput: %.0f ops\n", rate);
+	LogLevel ll = NOTICE;
+	if (targetMissCount > 0) {
+			ll = WARNING;
+	}
+	
+	RAMCLOUD_LOG(ll,
+					"Actual OPS %.0f / Target OPS %lu",
+					static_cast<double>(opCount) /
+					static_cast<double>(Cycles::toSeconds(stop - start)),
+					static_cast<uint64_t>(targetOps));
+	RAMCLOUD_LOG(ll,
+					"%lu Misses / %lu Total -- %lu/%lu R/W",
+					targetMissCount, opCount, readCount, writeCount);
+	
+    //printf("0.0 Max Throughput: %.0f ops\n", rate);
 
     dumpSamples(samples, experimentStartTicks);
 
@@ -6539,8 +6696,9 @@ try
 {
     // Parse command-line options.
     vector<string> testNames;
-    string coordinatorLocator, logFile;
-    string logLevel("NOTICE");
+    //string coordinatorLocator, logFile;
+    string logFile;
+	string logLevel("NOTICE");
     po::options_description desc(
             "Usage: ClusterPerf [options] testName testName ...\n\n"
             "Runs one or more benchmarks on a RAMCloud cluster and outputs\n"
@@ -6594,7 +6752,9 @@ try
                  po::value<int>(&migratePercentage)->default_value(0),
                 "For readDistWorkload and writeDistWorkload, the percentage "
                 "of the first table from migrate in the middle of the "
-                "benchmark. If 0 (the default), then no migration is done.");
+                "benchmark. If 0 (the default), then no migration is done.")
+        ("numServers", po::value<int>(&numServers)->default_value(-1),
+                "Number of serers to use for test");
     po::positional_options_description desc2;
     desc2.add("testName", -1);
     po::variables_map vm;
@@ -6623,12 +6783,60 @@ try
         exit(1);
     }
 
+	dataTablesNum = (numServers - 1) * (numServers - 1);
     RamCloud r(&context, coordinatorLocator.c_str());
     cluster = &r;
-    cluster->createTable("data");
-    dataTable = cluster->getTableId("data");
+	
     cluster->createTable("control");
     controlTable = cluster->getTableId("control");
+
+	if (clientIndex == 0) {
+		const uint16_t keyLen = 0;
+		char key[keyLen];
+		char value[objectSize];
+		ObjectFinder objectFinder(&context);
+
+//		cluster->write(controlTable, key, keyLen, value, objectSize);
+//		Transport::SessionRef sessionCtrl = objectFinder.lookup(controlTable, key, keyLen);
+//		ServerId controlServerId = PingClient::getServerId(&context, sessionCtrl);
+//		printf("controlTableId: %lu \n", controlTable);
+//		printf("controlServerId: %lu \n", controlServerId.getId());
+
+
+	
+		dataTables.assign(dataTablesNum, -1);
+	    int tablesNumPerServer = dataTablesNum / (numServers - 1);
+    	//printf("tablesNumPerServer, %d \n", tablesNumPerServer);
+		dummyDataTables.assign(tablesNumPerServer, -1);
+		createTablesDummy(dataTables, dummyDataTables, objectSize, "0", 1);
+		for(int t = 0; t < dataTablesNum; ++t)
+		{
+			printf("dataTables: %lu \n", dataTables[t]);
+			cluster->write(dataTables[t], key, keyLen, value, objectSize);
+			Transport::SessionRef sessionIth = objectFinder.lookup(dataTables[t], key, keyLen);
+			ServerId serverIdIth = PingClient::getServerId(&context, sessionIth);
+			printf("serverId: %lu \n", serverIdIth.getId());
+		}
+		for(unsigned int t = 0; t < dummyDataTables.size(); ++t)
+		{
+			printf("dummyDataTables: %lu \n", dummyDataTables[t]);
+			cluster->write(dummyDataTables[t], key, keyLen, value, objectSize);
+			Transport::SessionRef sessionIth = objectFinder.lookup(dummyDataTables[t], key, keyLen);
+			ServerId serverIdIth = PingClient::getServerId(&context, sessionIth);
+			printf("serverId: %lu \n", serverIdIth.getId());
+		}
+
+		Transport::SessionRef session = objectFinder.lookup(dummyDataTables[0], key, keyLen);
+		emptyServerId = PingClient::getServerId(&context, session);
+		printf("emptyTableId: %lu \n", dummyDataTables[0]);
+		printf("emptyServerId: %lu \n", emptyServerId.getId());
+	}
+
+    //cluster->createTable("data");
+    //dataTable = cluster->getTableId("data");
+   // cluster->createTable("control");
+   // controlTable = cluster->getTableId("control");
+
 
     if (testNames.size() == 0) {
         // No test names specified; run all tests.

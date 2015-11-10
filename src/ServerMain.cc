@@ -202,7 +202,7 @@ main(int argc, char *argv[])
              "Number of backup copies to make for each segment")
             ("segmentFrames",
              ProgramOptions::value<uint32_t>(&config.backup.numSegmentFrames)->
-                default_value(512),
+                default_value(512 * 2),
              "Number of segment frames in backup storage")
             ("sync",
              ProgramOptions::bool_switch(&config.backup.sync),

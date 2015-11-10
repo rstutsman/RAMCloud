@@ -169,12 +169,22 @@ TabletManager::getTablet(uint64_t tableId,
     Lock guard(lock);
 
     TabletMap::iterator it = lookup(tableId, startKeyHash, guard);
-    if (it == tabletMap.end())
+    if (it == tabletMap.end()) {
+		printf("it == tabletMap.end() \n");
         return false;
+	}
 
     Tablet* t = &it->second;
     if (t->startKeyHash != startKeyHash || t->endKeyHash != endKeyHash)
-        return false;
+	{	
+		printf("start/end key hash does not match \n");
+        printf("t->startKeyHash, %lu", t->startKeyHash);
+		printf("startKeyHash, %lu", startKeyHash);
+	    printf("t->endKeyHash, %lu", t->endKeyHash);
+		printf("endKeyHash, %lu", endKeyHash);
+	
+		return false;
+	}
 
     if (outTablet != NULL)
         *outTablet = *t;
