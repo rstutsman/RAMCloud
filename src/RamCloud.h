@@ -28,7 +28,7 @@
 #include "ServerStatistics.pb.h"
 
 namespace RAMCloud {
-class ClientLease;
+class ClientLeaseAgent;
 class ClientTransactionManager;
 class MultiIncrementObject;
 class MultiReadObject;
@@ -146,19 +146,17 @@ class RamCloud {
     void write(uint64_t tableId, const void* key, uint16_t keyLength,
             const void* buf, uint32_t length,
             const RejectRules* rejectRules = NULL, uint64_t* version = NULL,
-            bool async = false, bool linearizable = false);
+            bool async = false);
     void write(uint64_t tableId, const void* key, uint16_t keyLength,
             const char* value, const RejectRules* rejectRules = NULL,
-            uint64_t* version = NULL, bool async = false,
-            bool linearizable = false);
+            uint64_t* version = NULL, bool async = false);
     void write(uint64_t tableId, uint8_t numKeys, KeyInfo *keyInfo,
             const void* buf, uint32_t length,
             const RejectRules* rejectRules = NULL, uint64_t* version = NULL,
-            bool async = false, bool linearizable = false);
+            bool async = false);
     void write(uint64_t tableId, uint8_t numKeys, KeyInfo *keyInfo,
             const char* value, const RejectRules* rejectRules = NULL,
-            uint64_t* version = NULL, bool async = false,
-            bool linearizable = false);
+            uint64_t* version = NULL, bool async = false);
 
     void poll();
     explicit RamCloud(const char* serviceLocator,
@@ -198,7 +196,7 @@ class RamCloud {
 
     // See "Header Minimization" in designNotes for info on why these
     // are pointers.
-    ClientLease *clientLease;
+    ClientLeaseAgent *clientLeaseAgent;
     RpcTracker *rpcTracker;
     ClientTransactionManager *transactionManager;
 
@@ -420,7 +418,7 @@ class GetTableIdRpc : public CoordinatorRpcWrapper {
  * Encapsulates the state of a RamCloud::incrementDouble operation,
  * allowing it to execute asynchronously.
  */
-class IncrementDoubleRpc : public ObjectRpcWrapper {
+class IncrementDoubleRpc : public LinearizableObjectRpcWrapper {
   public:
     IncrementDoubleRpc(RamCloud* ramcloud, uint64_t tableId, const void* key,
             uint16_t keyLength, double incrementValue,
@@ -436,7 +434,7 @@ class IncrementDoubleRpc : public ObjectRpcWrapper {
  * Encapsulates the state of a RamCloud::incrementInt64 operation,
  * allowing it to execute asynchronously.
  */
-class IncrementInt64Rpc : public ObjectRpcWrapper {
+class IncrementInt64Rpc : public LinearizableObjectRpcWrapper {
   public:
     IncrementInt64Rpc(RamCloud* ramcloud, uint64_t tableId, const void* key,
             uint16_t keyLength, int64_t incrementValue,
@@ -947,7 +945,7 @@ class ReadKeysAndValueRpc : public ObjectRpcWrapper {
  * Encapsulates the state of a RamCloud::remove operation,
  * allowing it to execute asynchronously.
  */
-class RemoveRpc : public ObjectRpcWrapper {
+class RemoveRpc : public LinearizableObjectRpcWrapper {
   public:
     RemoveRpc(RamCloud* ramcloud, uint64_t tableId, const void* key,
             uint16_t keyLength, const RejectRules* rejectRules = NULL);
@@ -1030,14 +1028,12 @@ class WriteRpc : public LinearizableObjectRpcWrapper {
   public:
     WriteRpc(RamCloud* ramcloud, uint64_t tableId, const void* key,
             uint16_t keyLength, const void* buf, uint32_t length,
-            const RejectRules* rejectRules = NULL, bool async = false,
-            bool linearizable = false);
+            const RejectRules* rejectRules = NULL, bool async = false);
     // this constructor will be used when the object has multiple keys
     WriteRpc(RamCloud* ramcloud, uint64_t tableId,
             uint8_t numKeys, KeyInfo *keyInfo,
             const void* buf, uint32_t length,
-            const RejectRules* rejectRules = NULL, bool async = false,
-            bool linearizable = false);
+            const RejectRules* rejectRules = NULL, bool async = false);
     ~WriteRpc() {}
     void wait(uint64_t* version = NULL);
 

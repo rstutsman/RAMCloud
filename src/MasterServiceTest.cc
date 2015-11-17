@@ -13,6 +13,8 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <algorithm>
+
 #include "TestUtil.h"
 
 #include "BackupStorage.h"
@@ -49,7 +51,7 @@ class MasterServiceRefresher : public ObjectFinder::TableConfigFetcher {
                     ObjectFinder::Indexlet>* tableIndexMap) {
         tableMap->clear();
 
-        Tablet rawEntry({1, 0, ~0, ServerId(),
+        Tablet rawEntry({1, 0, uint64_t(~0), ServerId(),
                             Tablet::NORMAL, LogPosition()});
         TabletWithLocator entry(rawEntry, "mock:host=master");
 
@@ -57,7 +59,7 @@ class MasterServiceRefresher : public ObjectFinder::TableConfigFetcher {
         tableMap->insert(std::make_pair(key, entry));
 
         if (refreshCount > 0) {
-            Tablet rawEntry2({99, 0, ~0, ServerId(),
+            Tablet rawEntry2({99, 0, uint64_t(~0), ServerId(),
                     Tablet::NORMAL, LogPosition()});
             TabletWithLocator entry2(rawEntry2, "mock:host=master");
 
@@ -339,6 +341,21 @@ class MasterServiceTest : public ::testing::Test {
     DISALLOW_COPY_AND_ASSIGN(MasterServiceTest);
 };
 
+/**
+ * Used to std::sort tablets by first their tableId then their start hash.
+ *
+ * \param a - tablet 1
+ * \param b - tablet 2
+ * \return  - true if a < b
+ */
+bool tabletCompare(const TabletManager::Tablet &a,
+                          const TabletManager::Tablet &b) {
+    if (a.tableId != b.tableId)
+        return a.tableId < b.tableId;
+    else
+        return a.startKeyHash < b.startKeyHash;
+}
+
 TEST_F(MasterServiceTest, dispatch_initializationNotFinished) {
     Buffer request, response;
     Service::Rpc rpc(NULL, &request, &response);
@@ -434,7 +451,6 @@ TEST_F(MasterServiceTest, dropIndexletOwnership) {
     EXPECT_EQ("dropIndexletOwnership: Dropped ownership of (or did not own) "
             "indexlet in tableId 2, indexId 1", TestLog::get());
 }
-
 
 TEST_F(MasterServiceTest, takeIndexletOwnership) {
 
@@ -615,13 +631,29 @@ TEST_F(MasterServiceTest, getServerStatistics) {
     MasterClient::splitMasterTablet(&context, masterServer->serverId, 1,
             (~0UL/2));
     ramcloud->getServerStatistics("mock:host=master", serverStats);
-    EXPECT_TRUE(StringUtil::startsWith(serverStats.ShortDebugString(),
-            "tabletentry { table_id: 1 "
-            "start_key_hash: 0 "
-            "end_key_hash: 9223372036854775806 } "
-            "tabletentry { table_id: 1 start_key_hash: 9223372036854775807 "
-            "end_key_hash: 18446744073709551615 } "
-            "spin_lock_stats { locks { name:"));
+    ASSERT_EQ(2, serverStats.tabletentry_size());
+
+    auto& entry0 = serverStats.tabletentry(0);
+    auto& entry1 = serverStats.tabletentry(1);
+
+    // The tablets are unordered so we need an order agnostic test
+    if (entry0.start_key_hash() < entry1.start_key_hash()) {
+        EXPECT_EQ(1U, entry0.table_id());
+        EXPECT_EQ(0U, entry0.start_key_hash());
+        EXPECT_EQ(9223372036854775806UL, entry0.end_key_hash());
+
+        EXPECT_EQ(1U, entry1.table_id());
+        EXPECT_EQ(9223372036854775807UL, entry1.start_key_hash());
+        EXPECT_EQ(18446744073709551615UL, entry1.end_key_hash());
+    } else {
+        EXPECT_EQ(1U, entry1.table_id());
+        EXPECT_EQ(0U, entry1.start_key_hash());
+        EXPECT_EQ(9223372036854775806UL, entry1.end_key_hash());
+
+        EXPECT_EQ(1U, entry0.table_id());
+        EXPECT_EQ(9223372036854775807UL, entry0.start_key_hash());
+        EXPECT_EQ(18446744073709551615UL, entry0.end_key_hash());
+    }
 }
 
 TEST_F(MasterServiceTest, increment_basic) {
@@ -650,6 +682,34 @@ TEST_F(MasterServiceTest, increment_basic) {
     ramcloud->read(1, "key1", 4, &buffer);
     buffer.copy(0, sizeof(newDouble), &newDouble);
     EXPECT_EQ(3.0, newDouble);
+}
+
+TEST_F(MasterServiceTest, increment_linearizability) {
+    Buffer buffer;
+    uint64_t version = 0;
+    int64_t oldInt64 = 1;
+    int64_t newInt64;
+
+    ramcloud->write(1, "key0", 4, &oldInt64, sizeof(oldInt64), NULL, NULL);
+    newInt64 = ramcloud->incrementInt64(1, "key0", 4, 2, NULL, &version);
+    EXPECT_EQ(2U, version);
+    EXPECT_EQ(3, newInt64);
+
+    ramcloud->read(1, "key0", 4, &buffer);
+    buffer.copy(0, sizeof(newInt64), &newInt64);
+    EXPECT_EQ(3, newInt64);
+
+    IncrementInt64Rpc incRpc(ramcloud.get(), 1, "key0", 4, 2);
+    WireFormat::Increment::Request* reqHdr =
+        incRpc.request.getStart<WireFormat::Increment::Request>();
+    newInt64 = incRpc.wait(&version);
+    EXPECT_EQ(5, newInt64);
+
+    WireFormat::Increment::Response respHdr;
+    Service::Rpc rpc(NULL, NULL, NULL);
+    service->increment(reqHdr, &respHdr, &rpc);
+    EXPECT_EQ(5, respHdr.newValue.asInt64);
+    EXPECT_EQ(STATUS_OK, respHdr.common.status);
 }
 
 TEST_F(MasterServiceTest, increment_create) {
@@ -697,6 +757,43 @@ TEST_F(MasterServiceTest, increment_rejectRules) {
     rules.versionNeGiven = true;
     EXPECT_THROW(ramcloud->incrementInt64(1, "key2", 4, 1, &rules, NULL),
                  WrongVersionException);
+}
+
+
+TEST_F(MasterServiceTest, increment_linearizability_rejectRules) {
+    int64_t value = 0;
+    uint64_t version = 0;
+    RejectRules rules;
+    memset(&rules, 0, sizeof(rules));
+    rules.doesntExist = true;
+
+    // Send first request.
+    IncrementInt64Rpc incRpc(ramcloud.get(), 1, "key0", 4, 1, &rules);
+    while (!incRpc.isReady()) {
+        ramcloud->poll();
+    }
+
+    // Make object exist.
+    ramcloud->write(1, "key0", 4, &value, sizeof(value), NULL, &version);
+    EXPECT_EQ(1U, version);
+
+    // Intentionally delayed wait() to prevent 2nd write request from having
+    // ackId same as rpcId for this rmvRpc. (So that we can retry.)
+    EXPECT_THROW(incRpc.wait(&version), ObjectDoesntExistException);
+
+    // Retry of increment: due to linearizability, we still get
+    //                     STATUS_OBJECT_DOESNT_EXIST.
+    WireFormat::Increment::Request* reqHdr =
+        incRpc.request.getStart<WireFormat::Increment::Request>();
+    WireFormat::Increment::Response respHdr;
+    Service::Rpc rpc(NULL, &incRpc.request, incRpc.response);
+    service->increment(reqHdr, &respHdr, &rpc);
+    EXPECT_EQ(STATUS_OBJECT_DOESNT_EXIST, respHdr.common.status);
+
+    // New RPC succeed.
+    value = ramcloud->incrementInt64(1, "key0", 4, 1, NULL, &version);
+    EXPECT_EQ(2U, version);
+    EXPECT_EQ(1, value);
 }
 
 TEST_F(MasterServiceTest, increment_invalidObject) {
@@ -749,6 +846,399 @@ TEST_F(MasterServiceTest, increment_parallel) {
     ramcloud->read(1, "key0", 4, &buffer);
     buffer.copy(0, sizeof(value), &value);
     EXPECT_EQ(2, value);
+}
+
+TEST_F(MasterServiceTest, migrateSingleLogEntry_basic) {
+    // Populate segment
+    Key key(1, "1", 1);
+    Buffer buffer;
+    Object obj(key, "value", 5, 0, 0, buffer);
+    EXPECT_EQ(STATUS_OK, service->objectManager.writeObject(obj, 0, 0));
+
+    LogIterator it(*service->objectManager.getLog());
+    Tub<Segment> transferSeg;
+
+    uint64_t entryTotals[TOTAL_LOG_ENTRY_TYPES] = {0};
+    uint64_t totalBytes = 0;
+    uint64_t tableId = 1;
+    uint64_t firstKeyHash = 0x0;
+    uint64_t lastKeyHash = 0xffffffffffffffff;
+    ServerId receiver(1);
+
+    Status error;
+    for (; !it.isDone(); it.next()) {
+        TestLog::reset();
+        error = service->migrateSingleLogEntry(
+                *it.getCurrentSegmentIterator(),
+                transferSeg, entryTotals, totalBytes,
+                tableId, firstKeyHash, lastKeyHash,
+                receiver);
+        if (error) break;
+    }
+
+    EXPECT_EQ(STATUS_OK, error);
+    EXPECT_EQ("migrateSingleLogEntry: Migrated log entry type Object",
+            TestLog::get());
+    EXPECT_EQ(33U, totalBytes);
+    EXPECT_EQ(1U, entryTotals[LOG_ENTRY_TYPE_OBJ]);
+}
+
+TEST_F(MasterServiceTest, migrateSingleLogEntry_wrongTable) {
+    // Populate segment
+    Key key(1, "1", 1);
+    Buffer buffer;
+    Object obj(key, "value", 5, 0, 0, buffer);
+    EXPECT_EQ(STATUS_OK, service->objectManager.writeObject(obj, 0, 0));
+
+    LogIterator it(*service->objectManager.getLog());
+    Tub<Segment> transferSeg;
+
+    uint64_t entryTotals[TOTAL_LOG_ENTRY_TYPES] = {0};
+    uint64_t totalBytes = 0;
+    uint64_t tableId = 2;
+    uint64_t firstKeyHash = 0x0;
+    uint64_t lastKeyHash = 0xffffffffffffffff;
+    ServerId receiver(1);
+
+    Status error;
+    for (; !it.isDone(); it.next()) {
+        TestLog::reset();
+        error = service->migrateSingleLogEntry(
+                *it.getCurrentSegmentIterator(),
+                transferSeg, entryTotals, totalBytes,
+                tableId, firstKeyHash, lastKeyHash,
+                receiver);
+        if (error) break;
+    }
+
+    EXPECT_EQ(STATUS_OK, error);
+    EXPECT_EQ("migrateSingleLogEntry: Object not migrated; "
+                    "tableId doesn't match",
+            TestLog::get());
+    EXPECT_EQ(0U, totalBytes);
+    EXPECT_EQ(0U, entryTotals[LOG_ENTRY_TYPE_OBJ]);
+}
+
+TEST_F(MasterServiceTest, migrateSingleLogEntry_wrongKeyHash) {
+    // Populate segment
+    Key key(1, "1", 1);
+    Buffer buffer;
+    Object obj(key, "value", 5, 0, 0, buffer);
+    EXPECT_EQ(STATUS_OK, service->objectManager.writeObject(obj, 0, 0));
+
+    LogIterator it(*service->objectManager.getLog());
+    Tub<Segment> transferSeg;
+
+    uint64_t entryTotals[TOTAL_LOG_ENTRY_TYPES] = {0};
+    uint64_t totalBytes = 0;
+    uint64_t tableId = 1;
+    uint64_t firstKeyHash = 0x0;
+    uint64_t lastKeyHash = 0x0;
+    ServerId receiver(1);
+
+    Status error;
+    for (; !it.isDone(); it.next()) {
+        TestLog::reset();
+        error = service->migrateSingleLogEntry(
+                *it.getCurrentSegmentIterator(),
+                transferSeg, entryTotals, totalBytes,
+                tableId, firstKeyHash, lastKeyHash,
+                receiver);
+        if (error) break;
+    }
+
+    EXPECT_EQ(STATUS_OK, error);
+    EXPECT_EQ("migrateSingleLogEntry: Object not migrated; "
+                    "keyHash not in range",
+            TestLog::get());
+    EXPECT_EQ(0U, totalBytes);
+    EXPECT_EQ(0U, entryTotals[LOG_ENTRY_TYPE_OBJ]);
+}
+
+TEST_F(MasterServiceTest, migrateSingleLogEntry_rpcResult) {
+    // Populate segment
+    Segment segment;
+
+    { // Migrate
+        uint64_t response = 1;
+        Buffer dataBuffer;
+        dataBuffer.append(&response, sizeof(response));
+        RpcResult rpcResult(1, 0, 6, 4, 2, dataBuffer);
+        Buffer buffer;
+        rpcResult.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_RPCRESULT, buffer));
+    }{ // Bad key hash
+        Buffer dataBuffer;
+        RpcResult rpcResult(1, 1, 5, 3, 1, dataBuffer);
+        Buffer buffer;
+        rpcResult.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_RPCRESULT, buffer));
+    }{ // Bad table
+        service->tabletManager.addTablet(10, 0, ~0UL, TabletManager::NORMAL);
+        Buffer dataBuffer;
+        RpcResult rpcResult(10, 0, 10, 5, 2, dataBuffer);
+        Buffer buffer;
+        rpcResult.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_RPCRESULT, buffer));
+    }
+
+    Tub<Segment> transferSeg;
+
+    uint64_t entryTotals[TOTAL_LOG_ENTRY_TYPES] = {0};
+    uint64_t totalBytes = 0;
+    uint64_t tableId = 1;
+    uint64_t firstKeyHash = 0x0;
+    uint64_t lastKeyHash = 0x0;
+    ServerId receiver(1);
+
+    TestLog::reset();
+    Status error;
+
+    for (SegmentIterator it(segment); !it.isDone(); it.next()) {
+        error = service->migrateSingleLogEntry(
+                it,
+                transferSeg, entryTotals, totalBytes,
+                tableId, firstKeyHash, lastKeyHash,
+                receiver);
+        if (error) break;
+    }
+
+    EXPECT_EQ(STATUS_OK, error);
+    EXPECT_EQ("migrateSingleLogEntry: Migrated log entry type "
+                    "Linearizable Rpc Record | "
+              "migrateSingleLogEntry: Linearizable Rpc Record not "
+                    "migrated; keyHash not in range | "
+              "migrateSingleLogEntry: Linearizable Rpc Record not "
+                    "migrated; tableId doesn't match",
+            TestLog::get());
+    EXPECT_EQ(52U, totalBytes);
+    EXPECT_EQ(1U, entryTotals[LOG_ENTRY_TYPE_RPCRESULT]);
+}
+
+TEST_F(MasterServiceTest, migrateSingleLogEntry_prepAndprepTomb) {
+    // Populate segment
+    Segment segment;
+
+    Key keyToMigrate(1, "1", 1);
+    Key keyBadHash(1, "2", 1);
+    assert(keyToMigrate.getHash() != keyBadHash.getHash());
+    Key keyBadTable(10, "1", 1);
+
+    { // Migrate
+        Buffer dataBuffer;
+        PreparedOp op(WireFormat::TxPrepare::WRITE,
+                      1UL, 10UL, 10UL,
+                      keyToMigrate, "hello", 6, 0, 0, dataBuffer);
+
+        Buffer buffer;
+        op.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_PREP, buffer));
+
+        PreparedOpTombstone opTomb(op, 0);
+        buffer.reset();
+        opTomb.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_PREPTOMB, buffer));
+    }{ // Bad key hash
+        Buffer dataBuffer;
+        PreparedOp op(WireFormat::TxPrepare::READ,
+                      1UL, 10UL, 10UL,
+                      keyBadHash, "hello", 6, 0, 0, dataBuffer);
+
+        Buffer buffer;
+        op.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_PREP, buffer));
+
+        PreparedOpTombstone opTomb(op, 0);
+        buffer.reset();
+        opTomb.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_PREPTOMB, buffer));
+    }{ // Bad table
+        service->tabletManager.addTablet(keyBadTable.getTableId(), 0, ~0UL,
+                                         TabletManager::NORMAL);
+        Buffer dataBuffer;
+        PreparedOp op(WireFormat::TxPrepare::WRITE,
+                      1UL, 10UL, 10UL,
+                      keyBadTable, "hello", 6, 0, 0, dataBuffer);
+
+        Buffer buffer;
+        op.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_PREP, buffer));
+
+        PreparedOpTombstone opTomb(op, 0);
+        buffer.reset();
+        opTomb.assembleForLog(buffer);
+        ASSERT_TRUE(segment.append(LOG_ENTRY_TYPE_PREPTOMB, buffer));
+    }
+
+    Tub<Segment> transferSeg;
+
+    uint64_t entryTotals[TOTAL_LOG_ENTRY_TYPES] = {0};
+    uint64_t totalBytes = 0;
+    uint64_t tableId = keyToMigrate.getTableId();
+    uint64_t firstKeyHash = keyToMigrate.getHash();
+    uint64_t lastKeyHash = keyToMigrate.getHash();
+    ServerId receiver(1);
+
+    TestLog::reset();
+    Status error;
+
+    for (SegmentIterator it(segment); !it.isDone(); it.next()) {
+        error = service->migrateSingleLogEntry(
+                it,
+                transferSeg, entryTotals, totalBytes,
+                tableId, firstKeyHash, lastKeyHash,
+                receiver);
+        if (error) break;
+    }
+
+    EXPECT_EQ(STATUS_OK, error);
+    EXPECT_EQ("migrateSingleLogEntry: Migrated log entry type "
+                    "Transaction Prepare Record | "
+              "migrateSingleLogEntry: Migrated log entry type "
+                    "Transaction Prepare Tombstone | "
+              "migrateSingleLogEntry: Transaction Prepare Record not "
+                    "migrated; keyHash not in range | "
+              "migrateSingleLogEntry: Transaction Prepare Tombstone not "
+                    "migrated; keyHash not in range | "
+              "migrateSingleLogEntry: Transaction Prepare Record not "
+                    "migrated; tableId doesn't match | "
+              "migrateSingleLogEntry: Transaction Prepare Tombstone not "
+                    "migrated; tableId doesn't match",
+            TestLog::get());
+    EXPECT_EQ(110U, totalBytes);
+    EXPECT_EQ(1U, entryTotals[LOG_ENTRY_TYPE_PREP]);
+    EXPECT_EQ(1U, entryTotals[LOG_ENTRY_TYPE_PREPTOMB]);
+}
+
+TEST_F(MasterServiceTest, migrateSingleLogEntry_decisionRecord) {
+    // Populate segment
+    {
+        // Migrate
+        TxDecisionRecord record(1, 0, 2, 1, WireFormat::TxDecision::COMMIT, 1);
+        service->objectManager.writeTxDecisionRecord(record);
+    }
+    {
+        // Bad table
+        service->tabletManager.addTablet(2, 0, ~0UL, TabletManager::NORMAL);
+        TxDecisionRecord record(2, 0, 2, 1, WireFormat::TxDecision::COMMIT, 1);
+        service->objectManager.writeTxDecisionRecord(record);
+    }
+    {
+        // Bad key hash
+        TxDecisionRecord record(1, 1, 2, 1, WireFormat::TxDecision::COMMIT, 1);
+        service->objectManager.writeTxDecisionRecord(record);
+    }
+
+    LogIterator it(*service->objectManager.getLog());
+    Tub<Segment> transferSeg;
+
+    uint64_t entryTotals[TOTAL_LOG_ENTRY_TYPES] = {0};
+    uint64_t totalBytes = 0;
+    uint64_t tableId = 1;
+    uint64_t firstKeyHash = 0x0;
+    uint64_t lastKeyHash = 0x0;
+    ServerId receiver(1);
+
+    TestLog::reset();
+    Status error;
+    for (; !it.isDone(); it.next()) {
+        error = service->migrateSingleLogEntry(
+                *it.getCurrentSegmentIterator(),
+                transferSeg, entryTotals, totalBytes,
+                tableId, firstKeyHash, lastKeyHash,
+                receiver);
+        if (error) break;
+    }
+
+    EXPECT_EQ(STATUS_OK, error);
+    EXPECT_EQ("migrateSingleLogEntry: Ignoring log entry type Segment Header | "
+              "migrateSingleLogEntry: Ignoring log entry type Log Digest | "
+              "migrateSingleLogEntry: Ignoring log entry type "
+                    "Table Stats Digest | "
+              "migrateSingleLogEntry: Ignoring log entry type "
+                    "Object Safe Version | "
+              "migrateSingleLogEntry: Migrated log entry type "
+                    "Transaction Decision Record | "
+              "migrateSingleLogEntry: Transaction Decision Record not "
+                    "migrated; tableId doesn't match | "
+              "migrateSingleLogEntry: Transaction Decision Record not "
+                    "migrated; keyHash not in range",
+            TestLog::get());
+    EXPECT_EQ(48U, totalBytes);
+    EXPECT_EQ(1U, entryTotals[LOG_ENTRY_TYPE_TXDECISION]);
+}
+
+TEST_F(MasterServiceTest, migrateSingleLogEntry_participantList) {
+    // Populate segment
+    {
+        // Good
+        WireFormat::TxParticipant participants[4];
+        participants[0] = WireFormat::TxParticipant(123, 0, 10);
+        participants[1] = WireFormat::TxParticipant(1, 2, 11);
+        participants[2] = WireFormat::TxParticipant(1, 0, 12);
+        participants[3] = WireFormat::TxParticipant(10, 0, 13);
+        ParticipantList record(participants, 4, 42, 9);
+        uint64_t logRef;
+        service->objectManager.logTransactionParticipantList(record, &logRef);
+    }
+    {
+        // Bad
+        WireFormat::TxParticipant participants[3];
+        participants[0] = WireFormat::TxParticipant(123, 224, 10);
+        participants[1] = WireFormat::TxParticipant(222, 2, 11);
+        participants[2] = WireFormat::TxParticipant(111, 0, 12);
+        ParticipantList record(participants, 3, 42, 9);
+        uint64_t logRef;
+        service->objectManager.logTransactionParticipantList(record, &logRef);
+    }
+    {
+        // Bad
+        WireFormat::TxParticipant participants[3];
+        participants[0] = WireFormat::TxParticipant(123, 224, 10);
+        participants[1] = WireFormat::TxParticipant(222, 2, 11);
+        participants[2] = WireFormat::TxParticipant(1, 2, 12);
+        ParticipantList record(participants, 3, 42, 9);
+        uint64_t logRef;
+        service->objectManager.logTransactionParticipantList(record, &logRef);
+    }
+
+    LogIterator it(*service->objectManager.getLog());
+    Tub<Segment> transferSeg;
+
+    uint64_t entryTotals[TOTAL_LOG_ENTRY_TYPES] = {0};
+    uint64_t totalBytes = 0;
+    uint64_t tableId = 1;
+    uint64_t firstKeyHash = 0x0;
+    uint64_t lastKeyHash = 0x0;
+    ServerId receiver(1);
+
+    TestLog::reset();
+    Status error;
+    for (; !it.isDone(); it.next()) {
+        error = service->migrateSingleLogEntry(
+                *it.getCurrentSegmentIterator(),
+                transferSeg, entryTotals, totalBytes,
+                tableId, firstKeyHash, lastKeyHash,
+                receiver);
+        if (error) break;
+    }
+
+    EXPECT_EQ(STATUS_OK, error);
+    EXPECT_EQ("migrateSingleLogEntry: Ignoring log entry type Segment Header | "
+              "migrateSingleLogEntry: Ignoring log entry type Log Digest | "
+              "migrateSingleLogEntry: Ignoring log entry type "
+                    "Table Stats Digest | "
+              "migrateSingleLogEntry: Ignoring log entry type "
+                    "Object Safe Version | "
+              "migrateSingleLogEntry: Migrated log entry type "
+                    "Transaction Participant List Record | "
+              "migrateSingleLogEntry: Transaction Participant List Record not "
+                    "migrated; tableId doesn't match | "
+              "migrateSingleLogEntry: Transaction Participant List Record not "
+                    "migrated; keyHash not in range",
+            TestLog::get());
+    EXPECT_EQ(120U, totalBytes);
+    EXPECT_EQ(1U, entryTotals[LOG_ENTRY_TYPE_TXPLIST]);
 }
 
 TEST_F(MasterServiceTest, migrateTablet_tabletNotOnServer) {
@@ -827,7 +1317,7 @@ TEST_F(MasterServiceTest, migrateTablet_movingData) {
             "migrateTablet: Sending last migration segment | "
             "migrateTablet: Migration succeeded for tablet "
             "[0x0,0xffffffffffffffff] in tableId 1; sent 1 objects and "
-            "0 tombstones to server 3.0 at mock:host=master2, 36 bytes in total"
+            "0 tombstones to server 3.0 at mock:host=master2, 92 bytes in total"
             " | deleteKeyHashRange: tableId 1 range [0x0,0xffffffffffffffff]"
             , TestLog::get());
 
@@ -1183,8 +1673,8 @@ TEST_F(MasterServiceTest, multiWrite_nullAndEmptyValues) {
     EXPECT_EQ(0U, valueLength);
 
     // See if we can transition back to something non-zero length
-    requests = {&request3, &request4};
-    ramcloud->multiWrite(requests, 2);
+    MultiWriteObject* requests2[] = {&request3, &request4};
+    ramcloud->multiWrite(requests2, 2);
 
     EXPECT_EQ(STATUS_OK, request3.status);
     EXPECT_EQ(3U, request3.version);
@@ -1580,16 +2070,47 @@ TEST_F(MasterServiceTest, remove_basics) {
     uint64_t version;
     ramcloud->remove(1, "key0", 4, NULL, &version);
     EXPECT_EQ(1U, version);
-    EXPECT_EQ(format("free: free on reference %lu | "
-            "sync: syncing segment 1 to offset 156 | "
-            "schedule: scheduled | "
-            "performWrite: Sending write to backup 1.0 | "
-            "schedule: scheduled | "
-            "performWrite: Write RPC finished for replica slot 0 | "
-            "sync: log synced", ref),
-            TestLog::get());
+    EXPECT_TRUE(StringUtil::contains(TestLog::get(),
+            format("free: free on reference %lu ", ref)));
 
     Buffer value;
+    EXPECT_THROW(ramcloud->read(1, "key0", 4, &value),
+            ObjectDoesntExistException);
+}
+
+TEST_F(MasterServiceTest, remove_linearizability) {
+    ramcloud->write(1, "key0", 4, "item0", 5);
+
+    TestLog::Enable _(antiGetEntryFilter);
+    Key key(1, "key0", 4);
+    HashTable::Candidates c;
+    service->objectManager.objectMap.lookup(key.getHash(), c);
+    uint64_t ref = c.getReference();
+    uint64_t version;
+
+    // Send first request.
+    RemoveRpc rmvRpc(ramcloud.get(), 1, "key0", 4);
+    WireFormat::Remove::Request* reqHdr =
+        rmvRpc.request.getStart<WireFormat::Remove::Request>();
+    rmvRpc.wait(&version);
+    EXPECT_EQ(1U, version);
+    EXPECT_TRUE(StringUtil::contains(TestLog::get(),
+            format("free: free on reference %lu ", ref)));
+    string testLogBefore = TestLog::get();
+
+    Buffer value;
+    EXPECT_THROW(ramcloud->read(1, "key0", 4, &value),
+            ObjectDoesntExistException);
+
+    // Retry with same header.
+    WireFormat::Remove::Response respHdr;
+    Service::Rpc rpc(NULL, NULL, NULL);
+    service->remove(reqHdr, &respHdr, &rpc);
+    EXPECT_EQ(1U, respHdr.version);
+    EXPECT_EQ(STATUS_OK, respHdr.common.status);
+    EXPECT_EQ(testLogBefore, TestLog::get());
+
+    value.reset();
     EXPECT_THROW(ramcloud->read(1, "key0", 4, &value),
             ObjectDoesntExistException);
 }
@@ -1597,9 +2118,9 @@ TEST_F(MasterServiceTest, remove_basics) {
 TEST_F(MasterServiceTest, remove_tableNotOnServer) {
     TestLog::Enable _;
     EXPECT_THROW(ramcloud->remove(99, "key0", 4), TableDoesntExistException);
-    EXPECT_EQ("checkStatus: Server mock:host=master doesn't store "
-            "<99, 0xb3a4e310e6f49dd8>; refreshing object map",
-            TestLog::get());
+    EXPECT_TRUE(StringUtil::contains(TestLog::get(),
+                "checkStatus: Server mock:host=master doesn't store "
+                "<99, 0xb3a4e310e6f49dd8>; refreshing object map"));
 }
 
 TEST_F(MasterServiceTest, remove_rejectRules) {
@@ -1613,6 +2134,60 @@ TEST_F(MasterServiceTest, remove_rejectRules) {
     EXPECT_THROW(ramcloud->remove(1, "key0", 4, &rules, &version),
             WrongVersionException);
     EXPECT_EQ(1U, version);
+}
+
+TEST_F(MasterServiceTest, remove_linearizability_rejectRules) {
+    ramcloud->write(1, "key0", 4, "item0", 5);
+
+    TestLog::Enable _(antiGetEntryFilter);
+    Key key(1, "key0", 4);
+    HashTable::Candidates c;
+    service->objectManager.objectMap.lookup(key.getHash(), c);
+    uint64_t ref = c.getReference();
+    uint64_t version;
+
+    RejectRules rules;
+    memset(&rules, 0, sizeof(rules));
+    rules.versionNeGiven = true;
+    rules.givenVersion = 2;
+
+    // Send first request.
+    RemoveRpc rmvRpc(ramcloud.get(), 1, "key0", 4, &rules);
+    while (!rmvRpc.isReady()) {
+        ramcloud->poll();
+    }
+    EXPECT_FALSE(StringUtil::contains(TestLog::get(),
+            format("free: free on reference %lu ", ref)));
+
+    // Bump version to 2. RejectRule should not met anymore.
+    ramcloud->write(1, "key0", 4, "item0", 5, NULL, &version);
+    EXPECT_EQ(2U, version);
+    EXPECT_TRUE(StringUtil::contains(TestLog::get(),
+            format("free: free on reference %lu ", ref)));
+
+    service->objectManager.objectMap.lookup(key.getHash(), c);
+    ref = c.getReference();
+
+    // Intentionally delayed wait() to prevent 2nd write request from having
+    // ackId same as rpcId for this rmvRpc. (So that we can retry.)
+    EXPECT_THROW(rmvRpc.wait(&version), WrongVersionException);
+
+    // Retry of remove: due to linearizability, we still get
+    //                  STATUS_WRONG_VERSION.
+    WireFormat::Remove::Request* reqHdr =
+        rmvRpc.request.getStart<WireFormat::Remove::Request>();
+    WireFormat::Remove::Response respHdr;
+    Service::Rpc rpc(NULL, &rmvRpc.request, rmvRpc.response);
+    service->remove(reqHdr, &respHdr, &rpc);
+    EXPECT_EQ(STATUS_WRONG_VERSION, respHdr.common.status);
+    EXPECT_FALSE(StringUtil::contains(TestLog::get(),
+            format("free: free on reference %lu ", ref)));
+
+    // New RPC with same RejectRule succeed.
+    ramcloud->remove(1, "key0", 4, &rules, &version);
+    EXPECT_EQ(2U, version);
+    EXPECT_TRUE(StringUtil::contains(TestLog::get(),
+            format("free: free on reference %lu ", ref)));
 }
 
 TEST_F(MasterServiceTest, remove_objectAlreadyDeletedRejectRules) {
@@ -1634,6 +2209,41 @@ TEST_F(MasterServiceTest, remove_objectAlreadyDeleted) {
     ramcloud->remove(1, "key0", 4);
     ramcloud->remove(1, "key0", 4, NULL, &version);
     EXPECT_EQ(VERSION_NONEXISTENT, version);
+}
+
+TEST_F(MasterServiceTest, remove_linearizability_objectAlreadyDeleted) {
+    TestLog::Enable _(antiGetEntryFilter);
+    Key key(1, "key0", 4);
+    uint64_t version;
+
+    // Send first request.
+    RemoveRpc rmvRpc(ramcloud.get(), 1, "key0", 4);
+    while (!rmvRpc.isReady()) {
+        ramcloud->poll();
+    }
+
+    // Make object exist.
+    ramcloud->write(1, "key0", 4, "item0", 5, NULL, &version);
+    EXPECT_EQ(1U, version);
+
+    // Intentionally delayed wait() to prevent 2nd write request from having
+    // ackId same as rpcId for this rmvRpc. (So that we can retry.)
+    rmvRpc.wait(&version);
+    EXPECT_EQ(VERSION_NONEXISTENT, version);
+
+    // Retry of remove: due to linearizability, we still get
+    //                  VERSION_NONEXISTENT.
+    WireFormat::Remove::Request* reqHdr =
+        rmvRpc.request.getStart<WireFormat::Remove::Request>();
+    WireFormat::Remove::Response respHdr;
+    Service::Rpc rpc(NULL, &rmvRpc.request, rmvRpc.response);
+    service->remove(reqHdr, &respHdr, &rpc);
+    EXPECT_EQ(STATUS_OK, respHdr.common.status);
+    EXPECT_EQ(VERSION_NONEXISTENT, respHdr.version);
+
+    // New RPC succeed.
+    ramcloud->remove(1, "key0", 4, NULL, &version);
+    EXPECT_EQ(1U, version);
 }
 
 TEST_F(MasterServiceTest, requestInsertIndexEntries_noIndexEntries) {
@@ -1914,27 +2524,23 @@ TEST_F(MasterServiceTest, splitAndMigrateIndexlet_wrongPartition) {
                     TestLog::get());
 }
 
-#if 0
-// This test is disabled because it fails due to bug RAM-788. It should be
-// re-enabled once the bug is fixed.
 TEST_F(MasterServiceTest, splitAndMigrateIndexlet_moveData) {
     uint64_t dataTableId = ramcloud->createTable("dataTable");
     uint64_t backingTableId = ramcloud->createTable("backingTable");
 
     uint8_t indexId = 1;
-    string firstKey = "abc";
+    string firstKey = "aaa";
     string splitKey = "pqr";
-    string firstNotOwnedKey = "xyz";
+    string firstNotOwnedKey = "zzz";
 
     service->indexletManager.addIndexlet(dataTableId, indexId, backingTableId,
             firstKey.c_str(), (uint16_t)firstKey.length(),
             firstNotOwnedKey.c_str(), (uint16_t)firstNotOwnedKey.length());
 
-    service->indexletManager.insertEntry(dataTableId, indexId,
-            "queen", 5, 12345U);
-    service->objectManager.log.sync();
-    service->indexletManager.insertEntry(dataTableId, indexId,
-            "queeN", 5, 1234U);
+    service->indexletManager.insertEntry(
+            dataTableId, indexId, "abcd", 4, 2581U);
+    service->indexletManager.insertEntry(
+            dataTableId, indexId, "tuvw", 4, 9213U);
     service->objectManager.log.sync();
 
     // Add new server after creating the data table and the backing table for
@@ -1943,32 +2549,41 @@ TEST_F(MasterServiceTest, splitAndMigrateIndexlet_moveData) {
     master2Config.master.numReplicas = 0;
     master2Config.localLocator = "mock:host=master2";
     Server* master2 = cluster.addServer(master2Config);
-    Log* master2Log = &master2->master->objectManager.log;
-    master2Log->sync();
+    MasterService* service2 = master2->master.get();
+    service2->objectManager.log.sync();
 
-    uint64_t newBackingTableId = ramcloud->createTable("newBackingTable");
+    uint64_t newBackingTableId = cluster.coordinator->tableManager.createTable(
+            "newBackingTable", 1, master2->serverId);
     MasterClient::prepForIndexletMigration(
             &context, master2->serverId, dataTableId, indexId,
             newBackingTableId,
             splitKey.c_str(), (uint16_t)splitKey.length(),
             firstNotOwnedKey.c_str(), (uint16_t)firstNotOwnedKey.length());
 
-    TestLog::Enable _("splitAndMigrateIndexlet");
+    TestLog::Enable _("splitAndMigrateIndexlet",
+            "migrateSingleIndexObject", "isGreaterOrEqual", NULL);
     EXPECT_NO_THROW(MasterClient::splitAndMigrateIndexlet(
             &context, masterServer->serverId, master2->serverId,
             dataTableId, indexId,
             backingTableId, newBackingTableId,
             splitKey.c_str(), (uint16_t)splitKey.length()));
-    EXPECT_EQ("splitAndMigrateIndexlet: Migrating a partition of an indexlet "
-            "in indexId 1 in tableId 1 "
-            "from server 2.0 at mock:host=master "
-            "(this server) to server 3.0 at mock:host=master2. | "
+
+    EXPECT_EQ("splitAndMigrateIndexlet: Migrating a partition of "
+            "an indexlet in indexId 1 in tableId 1 "
+            "from server 2.0 at mock:host=master (this server) "
+            "to server 3.0 at mock:host=master2. | "
+            "isGreaterOrEqual: Checking leaf node entry  "
+            "( pKHash: 2581 keyLength: 4 key: abcd ). | "
+            "migrateSingleIndexObject: Found entry that doesn't belong to the "
+            "partition being migrated. Continuing to the next. | "
+            "isGreaterOrEqual: Checking leaf node entry  "
+            "( pKHash: 9213 keyLength: 4 key: tuvw ). | "
+            "migrateSingleIndexObject: Migrating an index entry. | "
             "splitAndMigrateIndexlet: Sending last migration segment | "
             "splitAndMigrateIndexlet: Sent 1 total objects, "
-            "1 total tombstones, 261 total bytes.",
+            "1 total tombstones, 259 total bytes.",
                     TestLog::get());
 }
-#endif
 
 TEST_F(MasterServiceTest, splitMasterTablet) {
 
@@ -2035,10 +2650,10 @@ TEST_F(MasterServiceTest, takeTabletOwnership_newTablet) {
                 "endKeyHash: 1 state: 0 reads: 0 writes: 0 }\n"
                 "{ tableId: 2 startKeyHash: 0 "
                 "endKeyHash: 1 state: 0 reads: 0 writes: 0 }\n"
-                "{ tableId: 2 startKeyHash: 4 "
-                "endKeyHash: 5 state: 0 reads: 0 writes: 0 }\n"
                 "{ tableId: 2 startKeyHash: 2 "
                 "endKeyHash: 3 state: 0 reads: 0 writes: 0 }\n"
+                "{ tableId: 2 startKeyHash: 4 "
+                "endKeyHash: 5 state: 0 reads: 0 writes: 0 }\n"
                 "{ tableId: 3 startKeyHash: 0 "
                 "endKeyHash: 1 state: 0 reads: 0 writes: 0 }",
                 service->tabletManager.toString());
@@ -2121,11 +2736,11 @@ TEST_F(MasterServiceTest, txDecision_commit) {
     participants[2] = TxParticipant(key3.getTableId(), key3.getHash(), 12U);
     // create an object just so that buffer will be populated with the key
     // and the value. This keeps the abstractions intact
-    PreparedOp op1(TxPrepare::READ, 1, 10, 3, participants,
+    PreparedOp op1(TxPrepare::READ, 1, 10, 10,
                    key1, "", 0, 0, 0, buffer);
-    PreparedOp op2(TxPrepare::REMOVE, 1, 11, 3, participants,
+    PreparedOp op2(TxPrepare::REMOVE, 1, 10, 11,
                    key2, "", 0, 0, 0, buffer);
-    PreparedOp op3(TxPrepare::WRITE, 1, 12, 3, participants,
+    PreparedOp op3(TxPrepare::WRITE, 1, 10, 12,
                    key3, "new", 3, 0, 0, buffer);
 
     WireFormat::TxPrepare::Vote vote;
@@ -2217,11 +2832,11 @@ TEST_F(MasterServiceTest, txDecision_abort) {
     participants[2] = TxParticipant(key3.getTableId(), key3.getHash(), 12U);
     // create an object just so that buffer will be populated with the key
     // and the value. This keeps the abstractions intact
-    PreparedOp op1(TxPrepare::READ, 1, 10, 3, participants,
+    PreparedOp op1(TxPrepare::READ, 1, 10, 10,
                    key1, "", 0, 0, 0, buffer);
-    PreparedOp op2(TxPrepare::REMOVE, 1, 11, 3, participants,
+    PreparedOp op2(TxPrepare::REMOVE, 1, 10, 11,
                    key2, "", 0, 0, 0, buffer);
-    PreparedOp op3(TxPrepare::WRITE, 1, 12, 3, participants,
+    PreparedOp op3(TxPrepare::WRITE, 1, 10, 12,
                    key3, "new", 3, 0, 0, buffer);
 
     WireFormat::TxPrepare::Vote vote;
@@ -2295,9 +2910,9 @@ TEST_F(MasterServiceTest, txDecision_unknownTablet) {
     participants[2] = TxParticipant(key3.getTableId(), key3.getHash(), 12U);
     // create an object just so that buffer will be populated with the key
     // and the value. This keeps the abstractions intact
-    PreparedOp op1(TxPrepare::READ, 1, 10, 3, participants,
+    PreparedOp op1(TxPrepare::READ, 1, 10, 10,
                    key1, "", 0, 0, 0, buffer);
-    PreparedOp op3(TxPrepare::WRITE, 1, 12, 3, participants,
+    PreparedOp op3(TxPrepare::WRITE, 1, 10, 12,
                    key3, "new", 3, 0, 0, buffer);
 
     WireFormat::TxPrepare::Vote vote;
@@ -2372,11 +2987,13 @@ TEST_F(MasterServiceTest, txPrepare_basics) {
     reqHdr.common.opcode = WireFormat::Opcode::TX_PREPARE;
     reqHdr.common.service = WireFormat::MASTER_SERVICE;
     reqHdr.lease = {1, 10, 5};
-    reqHdr.ackId = 9;
+    reqHdr.clientTxId = 9;
+    reqHdr.ackId = 8;
     reqHdr.participantCount = 4;
     reqHdr.opCount = 3;
     reqBuffer.appendCopy(&reqHdr, sizeof32(reqHdr));
     reqBuffer.appendExternal(participants, sizeof32(TxParticipant) * 4);
+    TransactionId txId(1U, 9U);
 
     // 2A. ReadOp
     RejectRules rejectRules;
@@ -2412,6 +3029,9 @@ TEST_F(MasterServiceTest, txPrepare_basics) {
     EXPECT_FALSE(isObjectLocked(key1));
     EXPECT_FALSE(isObjectLocked(key2));
     EXPECT_FALSE(isObjectLocked(key3));
+    EXPECT_FALSE(service->objectManager.unackedRpcResults->hasRecord(
+                        txId.clientLeaseId,
+                        txId.clientTransactionId));
     {
         Buffer value;
         ramcloud->read(1, "key1", 4, &value, NULL, &version);
@@ -2442,6 +3062,9 @@ TEST_F(MasterServiceTest, txPrepare_basics) {
     EXPECT_TRUE(isObjectLocked(key1));
     EXPECT_TRUE(isObjectLocked(key2));
     EXPECT_TRUE(isObjectLocked(key3));
+    EXPECT_TRUE(service->objectManager.unackedRpcResults->hasRecord(
+                        txId.clientLeaseId,
+                        txId.clientTransactionId));
 
     Buffer value;
     ramcloud->read(1, "key1", 4, &value, NULL, &version);
@@ -2479,7 +3102,6 @@ TEST_F(MasterServiceTest, txPrepare_retriedPrepares) {
     Key key3(1, "key3", 4);
     Key key4(1, "key4", 4);
     Key key5(1, "key5", 4);
-    Buffer buffer, buffer2;
 
     WireFormat::TxParticipant participants[4];
     participants[0] = TxParticipant(key1.getTableId(), key1.getHash(), 10U);
@@ -2496,7 +3118,8 @@ TEST_F(MasterServiceTest, txPrepare_retriedPrepares) {
     reqHdr.common.opcode = WireFormat::Opcode::TX_PREPARE;
     reqHdr.common.service = WireFormat::MASTER_SERVICE;
     reqHdr.lease = {1, 10, 5};
-    reqHdr.ackId = 9;
+    reqHdr.clientTxId = 9;
+    reqHdr.ackId = 8;
     reqHdr.participantCount = 5;
     reqHdr.opCount = 3;
     reqBuffer.appendCopy(&reqHdr, sizeof32(reqHdr));
@@ -2652,7 +3275,8 @@ TEST_F(MasterServiceTest, txPrepare_singleRpcOptimization) {
     reqHdr.common.opcode = WireFormat::Opcode::TX_PREPARE;
     reqHdr.common.service = WireFormat::MASTER_SERVICE;
     reqHdr.lease = {1, 10, 5};
-    reqHdr.ackId = 9;
+    reqHdr.clientTxId = 9;
+    reqHdr.ackId = 8;
     reqHdr.participantCount = 3;
     reqHdr.opCount = 3;
     reqBuffer.appendCopy(&reqHdr, sizeof32(reqHdr));
@@ -2771,7 +3395,8 @@ TEST_F(MasterServiceTest, txPrepare_readOnly) {
     reqHdr.common.opcode = WireFormat::Opcode::TX_PREPARE;
     reqHdr.common.service = WireFormat::MASTER_SERVICE;
     reqHdr.lease = {1, 10, 5};
-    reqHdr.ackId = 9;
+    reqHdr.clientTxId = 9;
+    reqHdr.ackId = 8;
     reqHdr.participantCount = 4;
     reqHdr.opCount = 3;
     reqBuffer.appendCopy(&reqHdr, sizeof32(reqHdr));
@@ -2875,7 +3500,8 @@ TEST_F(MasterServiceTest, txPrepare_readOnly_failByLock) {
     reqHdr.common.opcode = WireFormat::Opcode::TX_PREPARE;
     reqHdr.common.service = WireFormat::MASTER_SERVICE;
     reqHdr.lease = {1, 10, 5};
-    reqHdr.ackId = 9;
+    reqHdr.clientTxId = 9;
+    reqHdr.ackId = 8;
     reqHdr.participantCount = 4;
     reqHdr.opCount = 3;
     reqBuffer.appendCopy(&reqHdr, sizeof32(reqHdr));
@@ -3008,7 +3634,8 @@ TEST_F(MasterServiceTest, txPrepare_readOnly_failByVer) {
     reqHdr.common.opcode = WireFormat::Opcode::TX_PREPARE;
     reqHdr.common.service = WireFormat::MASTER_SERVICE;
     reqHdr.lease = {1, 10, 5};
-    reqHdr.ackId = 9;
+    reqHdr.clientTxId = 9;
+    reqHdr.ackId = 8;
     reqHdr.participantCount = 4;
     reqHdr.opCount = 3;
     reqBuffer.appendCopy(&reqHdr, sizeof32(reqHdr));
@@ -3094,7 +3721,8 @@ TEST_F(MasterServiceTest, write_basics) {
     ramcloud->write(1, "key0", 4, "item0", 5, NULL, &version);
     EXPECT_EQ(1U, version);
     EXPECT_EQ("writeObject: object: 36 bytes, version 1 | "
-            "sync: syncing segment 1 to offset 118 | "
+            "writeObject: rpcResult: 56 bytes | "
+            "sync: syncing segment 1 to offset 176 | "
             "schedule: scheduled | "
             "performWrite: Sending write to backup 1.0 | "
             "schedule: scheduled | "
@@ -3176,7 +3804,7 @@ TEST_F(MasterServiceTest, write_rejectRules) {
     EXPECT_EQ(VERSION_NONEXISTENT, version);
 }
 
-TEST_F(MasterServiceTest, write_linearizable) {
+TEST_F(MasterServiceTest, write_linearizable_statusOK) {
     // Duplicate conditional write.
     ObjectBuffer value;
     uint64_t version;
@@ -3190,7 +3818,7 @@ TEST_F(MasterServiceTest, write_linearizable) {
     rules.versionNeGiven = true;
 
     WriteRpc writeRpc(ramcloud.get(), 1, "key0", 4, "item1", 5,
-                      &rules, false, true);
+                      &rules, false);
     WireFormat::Write::Request* reqHdr =
         writeRpc.request.getStart<WireFormat::Write::Request>();
     writeRpc.wait(&version);
@@ -3210,9 +3838,43 @@ TEST_F(MasterServiceTest, write_linearizable) {
     EXPECT_EQ(STATUS_OK, respHdr.common.status);
 
     // StaleRpcException test.
-    ramcloud->write(1, "key0", 4, "item2", 5, NULL, NULL, false, true);
+    ramcloud->write(1, "key0", 4, "item2", 5, NULL, NULL, false);
     EXPECT_THROW(service->write(reqHdr, &respHdr, &rpc),
                  StaleRpcException);
+}
+
+TEST_F(MasterServiceTest, write_linearizable_rejectRule) {
+    uint64_t version;
+    RejectRules rules;
+    memset(&rules, 0, sizeof(rules));
+    rules.doesntExist = true;
+
+    // 1st write.
+    WriteRpc writeRpc(ramcloud.get(), 1, "key0", 4, "item0", 5, &rules);
+    while (!writeRpc.isReady()) {
+        ramcloud->poll();
+    }
+
+    // 2nd write: Make that object exist now. RejectRule should not met anymore.
+    ramcloud->write(1, "key0", 4, "item0", 5, NULL, &version);
+    EXPECT_EQ(1U, version);
+
+    // Intentionally delayed wait() to prevent 2nd write request from having
+    // ackId same as rpcId for this writeRpc. (So that we can retry.)
+    EXPECT_THROW(writeRpc.wait(&version), ObjectDoesntExistException);
+
+    // Retry of 1st write: due to linearizability, we still get
+    //                     STATUS_OBJECT_DOESNT_EXIST.
+    WireFormat::Write::Request* reqHdr =
+        writeRpc.request.getStart<WireFormat::Write::Request>();
+    WireFormat::Write::Response respHdr;
+    Service::Rpc rpc(NULL, &writeRpc.request, writeRpc.response);
+    service->write(reqHdr, &respHdr, &rpc);
+    EXPECT_EQ(STATUS_OBJECT_DOESNT_EXIST, respHdr.common.status);
+
+    // New RPC with same RejectRule succeed.
+    ramcloud->write(1, "key0", 4, "item0", 5, &rules, &version);
+    EXPECT_EQ(2U, version);
 }
 
 /**
@@ -3343,8 +4005,9 @@ TEST_F(MasterServiceTest, recover_basics) {
         {backup1Id.getId(), 87},
     };
 
-    EXPECT_EQ(0lu, masterServer->master->clusterTime.load());
-    cluster.coordinator->leaseManager.clock.safeClusterTimeNS = 1000000000;
+    EXPECT_EQ(ClusterTime(0lu), masterServer->master->clusterClock.getTime());
+    cluster.coordinator->leaseAuthority.clock.safeClusterTime =
+                                                        ClusterTime(1000000000);
 
     TestLog::Enable __("replaySegment", "recover", "recoveryMasterFinished",
             "addKeyHashRange", NULL);
@@ -3353,7 +4016,7 @@ TEST_F(MasterServiceTest, recover_basics) {
             arrayLength(replicas));
     // safeVersion Recovered
     EXPECT_EQ(23U, segmentManager->safeVersion);
-    EXPECT_LT(0lu, masterServer->master->clusterTime.load());
+    EXPECT_LT(ClusterTime(0lu), masterServer->master->clusterClock.getTime());
 
     size_t curPos = 0; // Current Pos: given to getUntil()
     // Proceed read pointer

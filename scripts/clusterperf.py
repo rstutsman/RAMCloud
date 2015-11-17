@@ -684,8 +684,7 @@ simple_tests = [
     Test("netBandwidth", netBandwidth),
     Test("readAllToAll", readAllToAll),
     Test("readNotFound", default),
-    Test("linearizableRpc", basic),
-    Test("multiRead_colocation", default),
+    Test("multiRead_colocation", default)
 ]
 
 graph_tests = [
@@ -721,8 +720,6 @@ graph_tests = [
     Test("writeDistWorkload", workloadDist),
     Test("writeThroughput", readThroughput),
     Test("workloadThroughput", readThroughput),
-    Test("linearizableWriteDistRandom", writeDist),
-    Test("linearizableWriteThroughput", readThroughput),
 ]
 
 if __name__ == '__main__':
