@@ -283,6 +283,8 @@ def run_test(
         client_args['--migratePercentage'] = options.migratePercentage
     if options.quiet:
         client_args['--quiet'] = ''
+    if options.num_servers != None:
+        client_args['--numServers'] = options.num_servers
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
