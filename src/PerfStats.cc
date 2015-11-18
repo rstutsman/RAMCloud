@@ -89,6 +89,7 @@ PerfStats::collectStats(PerfStats* total)
         total->logSyncCycles += stats->logSyncCycles;
         total->segmentUnopenedCycles += stats->segmentUnopenedCycles;
         total->workerActiveCycles += stats->workerActiveCycles;
+        total->stalledForWorkerCycles += stats->stalledForWorkerCycles;
         total->compactorInputBytes += stats->compactorInputBytes;
         total->compactorSurvivorBytes += stats->compactorSurvivorBytes;
         total->compactorActiveCycles += stats->compactorActiveCycles;
@@ -160,6 +161,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             " %8.3f").c_str()));
     result.append(format("%-30s %s\n", "Worker load factor",
             formatMetricRatio(&diff, "workerActiveCycles", "collectionTime",
+            " %8.3f").c_str()));
+    result.append(format("%-30s %s\n", "Waiting for free worker",
+            formatMetricRatio(&diff, "stalledForWorkerCycles", "collectionTime",
             " %8.3f").c_str()));
 
     result.append("\nReads:\n");
@@ -336,6 +340,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         ADD_METRIC(writeKeyBytes);
         ADD_METRIC(dispatchActiveCycles);
         ADD_METRIC(workerActiveCycles);
+        ADD_METRIC(stalledForWorkerCycles);
         ADD_METRIC(logBytesAppended);
         ADD_METRIC(replicationRpcs);
         ADD_METRIC(logSyncCycles);

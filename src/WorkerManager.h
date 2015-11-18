@@ -47,6 +47,8 @@ class WorkerManager : Dispatch::Poller {
     void setServerId(ServerId serverId);
     Transport::ServerRpc* waitForRpc(double timeoutSeconds);
 
+    bool isOverloaded() { return busyThreads.size() >= maxCores; }
+
   PROTECTED:
 
     /// How many microseconds worker threads should remain in their polling

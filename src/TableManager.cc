@@ -1032,6 +1032,8 @@ TableManager::createTable(const Lock& lock, const char* name,
                         context->coordinatorServerList->nextServer(
                                 tabletMaster, {WireFormat::MASTER_SERVICE});
                 tabletMaster = currentTabletMaster;
+                LOG(ERROR, "Creating table %lu on Server %s",
+                        tableId, tabletMaster.toString().c_str());
             }
             if (!currentTabletMaster.isValid()) {
                 // The server list contains no functioning masters! Ask the

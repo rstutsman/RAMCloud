@@ -250,7 +250,7 @@ include bindings/python/Makefrag
 include $(wildcard private/MakefragPrivate)
 
 clean: tests-clean docs-clean tags-clean install-clean java-clean
-	rm -rf $(OBJDIR)/.deps $(OBJDIR)/*
+	-rm -rf $(OBJDIR)/.deps $(OBJDIR)/*
 
 check:
 	$(LINT) $$(./pragmas.py -f CPPLINT:5 $$(find $(TOP)/src '(' -name '*.cc' -or -name '*.h' -or -name '*.c' ')' -not -path '$(TOP)/src/btree/*' -not -path '$(TOP)/src/btreeRamCloud/*'))
@@ -279,14 +279,14 @@ docs:
 	 echo "INCLUDE_PATH = $(OBJDIR)"; ) | cat Doxyfile - | $(DOXYGEN) -
 
 docs-clean: python-docs-clean
-	rm -rf docs/doxygen/
+	-rm -rf docs/doxygen/
 
 tags:
 	find . -type f | grep -v "\.git" | grep -v docs | xargs etags
 	find . -type f | grep -v "\.git" | grep -v docs | xargs ctags
 
 tags-clean:
-	rm -f TAGS tags
+	-rm -f TAGS tags
 
 # The following target is useful for debugging Makefiles; it
 # prints the value of a make variable.
@@ -379,7 +379,7 @@ install: all java
 	cp bindings/java/build/install/ramcloud/lib/* $(INSTALL_DIR)/lib/ramcloud
 
 install-clean:
-	rm -rf install
+	-rm -rf install
 
 logcabin:
 	cd logcabin; \

@@ -139,6 +139,9 @@ int migratePercentage = 0;
 // That is, spannedOps + 1  servers will be accessed per multiread.
 int spannedOps = 0;
 
+// If true suppress sampling output, etc. Just create load.
+bool quiet;
+
 #define MAX_METRICS 8
 
 // The following type holds metrics for all the clients.  Each inner vector
@@ -374,7 +377,7 @@ class WorkloadGenerator {
      */
     void setup()
     {
-        #define BATCH_SIZE 500
+        const size_t BATCH_SIZE = 500;
         const uint16_t keyLength = 30;
 
         // Initialize keys and values
@@ -403,7 +406,7 @@ class WorkloadGenerator {
                 cluster->multiWrite(objects, BATCH_SIZE);
 
                 // Clean up the actual MultiWriteObjects
-                for (int k = 0; k < BATCH_SIZE; k++)
+                for (size_t k = 0; k < BATCH_SIZE; k++)
                     delete objects[k];
 
                 memset(keys, 0, BATCH_SIZE * keyLength);
@@ -1544,7 +1547,7 @@ waitSlave(int slave, const char* state, double timeout = 1.0)
  */
 void
 sendCommand(const char* command, const char* state, int firstSlave,
-            int numSlaves = 1)
+            int numSlaves = 1, double timeout = 1.0)
 {
     if (command != NULL) {
         for (int i = 0; i < numSlaves; i++) {
@@ -1555,7 +1558,7 @@ sendCommand(const char* command, const char* state, int firstSlave,
     }
     if (state != NULL) {
         for (int i = 0; i < numSlaves; i++) {
-            waitSlave(firstSlave+i, state);
+            waitSlave(firstSlave+i, state, timeout);
         }
     }
 }
@@ -4366,6 +4369,9 @@ struct Sample {
      * sample dumped by Dump().
      */
     static void DumpHeader() {
+        if (quiet)
+            return;
+
         printf(">>> startNs endNs durationNs table isWrite\n");
     }
 
@@ -4375,6 +4381,9 @@ struct Sample {
      * of the run.
      */
     void Dump(uint64_t experimentStartTicks) const {
+        if (quiet)
+            return;
+
         uint64_t startNs =
             Cycles::toNanoseconds(startTicks - experimentStartTicks);
         uint64_t endNs =
@@ -4415,6 +4424,7 @@ doWorkload(OpType type)
                 setSlaveState("running");
                 try
                 {
+                    sleep(10 + clientIndex);
                     loadGenerator.run(static_cast<uint64_t>(targetOps));
                 }
                 catch (TableDoesntExistException &e)
@@ -4576,7 +4586,7 @@ doWorkload(OpType type)
 
     // Stop slaves.
     cluster->dropTable("data");
-    sendCommand("done", NULL, 1, numClients-1);
+    sendCommand("done", NULL, 1, numClients-1, 10.0);
 
     printf("0.0 Max Throughput: %.0f ops\n", rate);
 
@@ -6382,7 +6392,8 @@ try
                  po::value<int>(&migratePercentage)->default_value(0),
                 "For readDistWorkload and writeDistWorkload, the percentage "
                 "of the first table from migrate in the middle of the "
-                "benchmark. If 0 (the default), then no migration is done.");
+                "benchmark. If 0 (the default), then no migration is done.")
+        ("quiet,q", po::bool_switch(&quiet), "Suppress output.");
     po::positional_options_description desc2;
     desc2.add("testName", -1);
     po::variables_map vm;

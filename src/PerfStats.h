@@ -89,6 +89,10 @@ struct PerfStats {
     /// as a worker.
     uint64_t workerActiveCycles;
 
+    /// Total time (in Cycles::rdtsc ticks) RPCs spent stalled waiting for a
+    /// free worker.
+    uint64_t stalledForWorkerCycles;
+
     //--------------------------------------------------------------------
     // Statistics for log replication follow below. These metrics are
     // related to new information appended to the head segment (i.e., not

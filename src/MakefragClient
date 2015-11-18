@@ -171,6 +171,10 @@ $(OBJDIR)/migrateTablet: $(OBJDIR)/MigrateTabletMain.o $(OBJDIR)/OptionParser.o 
 	@mkdir -p $(@D)
 	$(CXX) -o $@ $^ -L$(OBJDIR) $(LIBS)
 
+$(OBJDIR)/loadBalancer: $(OBJDIR)/LoadBalancer.o $(OBJDIR)/OptionParser.o $(OBJDIR)/libramcloud.a
+	@mkdir -p $(@D)
+	$(CXX) -o $@ $^ -L$(OBJDIR) $(LIBS)
+
 .PHONY: client client-lib client-lib-static client-lib-shared recovery ensureServers
 
 client-lib-static: $(OBJDIR)/libramcloud.a

@@ -185,6 +185,7 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
                 // Can't run this request right now.
                 levels[level].waitingRpcs.push(rpc);
                 rpcsWaiting++;
+                rpc->enqueuedAtCycles = Cycles::rdtsc();
                 return;
             }
         }
@@ -284,6 +285,12 @@ WorkerManager::poll()
                     if (level->waitingRpcs.empty()) {
                         continue;
                     }
+
+                    uint64_t enqueuedAtCycles =
+                        level->waitingRpcs.front()->enqueuedAtCycles;
+                    uint64_t waitedCycles = Cycles::rdtsc() - enqueuedAtCycles;
+                    PerfStats::threadStats.stalledForWorkerCycles += waitedCycles;
+
                     rpcsWaiting--;
                     level->requestsRunning++;
                     worker->level = i;

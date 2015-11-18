@@ -74,6 +74,7 @@ class Transport {
             , replyPayload()
             , epoch(0)
             , activities(~0)
+            , enqueuedAtCycles()
             , outstandingRpcListHook()
         {}
 
@@ -151,6 +152,8 @@ class Transport {
          */
         static const int READ_ACTIVITY = 1;
         static const int APPEND_ACTIVITY = 2;
+
+        uint64_t enqueuedAtCycles;
 
         /**
          * Hook for the list of active server RPCs that the ServerRpcPool class

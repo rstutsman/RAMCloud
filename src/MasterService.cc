@@ -3365,7 +3365,7 @@ MasterService::recover(uint64_t recoveryId, ServerId masterId,
     doneStartingInitialTasks:
 
     // As RPCs complete, process them and start more
-    Tub<CycleCounter<RawMetric>> readStallTicks;
+    Tub<CycleCounter<RawMetric>> readStallTicks{};
 
     bool gotFirstGRD = false;
 
