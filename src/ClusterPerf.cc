@@ -142,6 +142,10 @@ int spannedOps = 0;
 // If true suppress sampling output, etc. Just create load.
 bool quiet;
 
+// If true start adding clients one at a time once per second 10 seconds
+// into the load (only for doWorkload based loads).
+bool slowStart;
+
 #define MAX_METRICS 8
 
 // The following type holds metrics for all the clients.  Each inner vector
@@ -4424,7 +4428,8 @@ doWorkload(OpType type)
                 setSlaveState("running");
                 try
                 {
-                    sleep(10 + clientIndex);
+                    if (slowStart)
+                        sleep(10 + clientIndex);
                     loadGenerator.run(static_cast<uint64_t>(targetOps));
                 }
                 catch (TableDoesntExistException &e)
@@ -6393,7 +6398,10 @@ try
                 "For readDistWorkload and writeDistWorkload, the percentage "
                 "of the first table from migrate in the middle of the "
                 "benchmark. If 0 (the default), then no migration is done.")
-        ("quiet,q", po::bool_switch(&quiet), "Suppress output.");
+        ("quiet,q", po::bool_switch(&quiet), "Suppress output.")
+        ("slowStart", po::bool_switch(&slowStart), "Start client 0 at time zero, "
+             "waits 10 seconds, then adds one more client each second up to "
+             "specified number; only for doWorkload based loads.");
     po::positional_options_description desc2;
     desc2.add("testName", -1);
     po::variables_map vm;
