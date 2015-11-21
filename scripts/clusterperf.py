@@ -283,6 +283,8 @@ def run_test(
         client_args['--migratePercentage'] = options.migratePercentage
     if options.quiet:
         client_args['--quiet'] = ''
+    if options.slowStart:
+        client_args['--slowStart'] = ''
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -822,6 +824,9 @@ if __name__ == '__main__':
     parser.add_option('--quiet', action='store_true', default=False,
             dest='quiet',
             help='Supress stat output and just run load.')
+    parser.add_option('--slowStart', action='store_true', default=False,
+            dest='slowStart',
+            help='Start clients one at a time over time.')
     (options, args) = parser.parse_args()
 
     if options.parse:
