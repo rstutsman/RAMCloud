@@ -146,6 +146,9 @@ bool quiet;
 // into the load (only for doWorkload based loads).
 bool slowStart;
 
+// For doWorkload-based experiments tells how long to run before exiting.
+int seconds;
+
 #define MAX_METRICS 8
 
 // The following type holds metrics for all the clients.  Each inner vector
@@ -4501,12 +4504,24 @@ doWorkload(OpType type)
     uint64_t migrationCycles = 0;
 
     // Issue the reads back-to-back, and save the times.
+    const size_t maxSamples = targetOps * seconds;
+    if (maxSamples > 20lu * 1000 * 1000) {
+        RAMCLOUD_LOG(ERROR, "Asking the client to log a lot of samples. You "
+                "probably need to lower your targetOps (or add some form of "
+                "sampling to the code).");
+    }
+
     std::vector<Sample> samples{};
-    samples.reserve(count);
+    samples.reserve(maxSamples);
+
+    const uint64_t oneSecond = downCast<uint64_t>(Cycles::perSecond());
 
     const uint64_t experimentStartTicks = Cycles::rdtsc();
-    int i = 0;
-    while (i < count) {
+    const uint64_t targetEndTime =
+        experimentStartTicks + Cycles::fromSeconds(seconds);
+    RAMCLOUD_LOG(ERROR, "Start %lu End %lu", experimentStartTicks,
+            targetEndTime);
+    while (true) {
         // Generate random key.
         memset(key, 0, keyLen);
         string("workload").copy(key, 8);
@@ -4514,13 +4529,15 @@ doWorkload(OpType type)
                 loadGenerator.generator->nextNumber();
 
         // Perform Operation
+        uint64_t stop;
         if (generateRandom() <= readThreshold) {
             // Do read
             uint64_t start = Cycles::rdtsc();
             cluster->read(dataTable, key, keyLen, &readBuf);
+            stop = Cycles::rdtsc();
             if (type == READ_TYPE) {
-                samples.emplace_back(start, Cycles::rdtsc(), dataTable, 0);
-                i++;
+                if (samples.size() < maxSamples)
+                    samples.emplace_back(start, stop, dataTable, 0);
             }
             readCount++;
         } else {
@@ -4529,18 +4546,21 @@ doWorkload(OpType type)
             uint64_t start = Cycles::rdtsc();
             cluster->write(dataTable, key, keyLen, value,
                     loadGenerator.recordSizeB);
+            stop = Cycles::rdtsc();
             if (type == WRITE_TYPE) {
-                samples.emplace_back(start, Cycles::rdtsc(), dataTable, 1);
-                i++;
+                if (samples.size() < maxSamples)
+                    samples.emplace_back(start, stop, dataTable, 1);
             }
             writeCount++;
         }
 
         opCount++;
-        stop = Cycles::rdtsc();
 
         // Stick a migration in the middle of the benchmark, if requested.
-        if (migratePercentage && !migrationCycles && i > 50000) {
+        if (migratePercentage &&
+            !migrationCycles &&
+            stop > experimentStartTicks + oneSecond)
+        {
             if (!migration) {
                 RAMCLOUD_LOG(NOTICE, "Starting migration\n");
                 uint64_t endKeyHash = ~0lu;
@@ -4562,6 +4582,7 @@ doWorkload(OpType type)
         }
 
         // throttle
+        uint64_t now = stop;
         if (targetNSPO > 0) {
             nextStop = start +
                        Cycles::fromNanoseconds(
@@ -4569,11 +4590,15 @@ doWorkload(OpType type)
                             (generateRandom() % targetNSPO) -
                             (targetNSPO / 2));
 
-            if (Cycles::rdtsc() > nextStop) {
+            if (now > nextStop) {
                 targetMissCount++;
             }
-            while (Cycles::rdtsc() < nextStop);
+            while (now < nextStop) {
+                now = Cycles::rdtsc();
+            }
         }
+        if (now > targetEndTime)
+            break;
     }
 
     cluster->objectServerControl(dataTable, key, keyLen,
@@ -5413,6 +5438,13 @@ readDistRandom()
                 MICROS_PER_BUCKET*i, MICROS_PER_BUCKET*(i+1),
                 timeBuckets[i], 100.0*timeBuckets[i]/count);
     }
+}
+
+// Perform the specified workload and measure the read latencies.
+void
+migrateLoaded()
+{
+    doWorkload(READ_TYPE);
 }
 
 // Perform the specified workload and measure the read latencies.
@@ -6322,6 +6354,7 @@ TestInfo tests[] = {
     {"transactionContention", transactionContention},
     {"transactionDistRandom", transactionDistRandom},
     {"transactionThroughput", transactionThroughput},
+    {"migrateLoaded", migrateLoaded},
     {"multiWrite_oneMaster", multiWrite_oneMaster},
     {"multiRead_oneMaster", multiRead_oneMaster},
     {"multiRead_oneObjectPerMaster", multiRead_oneObjectPerMaster},
@@ -6410,9 +6443,12 @@ try
                 "of the first table from migrate in the middle of the "
                 "benchmark. If 0 (the default), then no migration is done.")
         ("quiet,q", po::bool_switch(&quiet), "Suppress output.")
-        ("slowStart", po::bool_switch(&slowStart), "Start client 0 at time zero, "
-             "waits 10 seconds, then adds one more client each second up to "
-             "specified number; only for doWorkload based loads.");
+        ("slowStart", po::bool_switch(&slowStart), "Start client 0 at time "
+             "zero, waits 10 seconds, then adds one more client each second "
+             "up to specified number; only for doWorkload based loads.")
+        ("seconds", po::value<int>(&seconds)->default_value(30),
+                "Number of seconds to run the experiment for; "
+                "only applies to doWorkload based experiments.");
     po::positional_options_description desc2;
     desc2.add("testName", -1);
     po::variables_map vm;
